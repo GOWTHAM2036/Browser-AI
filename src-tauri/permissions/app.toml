@@ -1,0 +1,16 @@
+[[permission]]
+identifier = "allow-all-commands"
+description = "Allows all app commands"
+commands.allow = [
+    "create_tab_webview",
+    "resize_tab_webview",
+    "destroy_tab_webview",
+    "navigate_tab_webview",
+    "eval_tab_webview",
+    "extract_page_text",
+    "send_page_content",
+    "save_credential",
+    "get_credential",
+    "delete_credential",
+    "log_from_frontend"
+]
