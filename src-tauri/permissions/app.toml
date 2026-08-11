@@ -12,5 +12,6 @@ commands.allow = [
     "save_credential",
     "get_credential",
     "delete_credential",
-    "log_from_frontend"
+    "log_from_frontend",
+    "reset_media_permissions"
 ]

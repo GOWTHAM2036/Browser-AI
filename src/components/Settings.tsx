@@ -1,8 +1,9 @@
 import React, { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useBrowserStore } from '../store/browserStore';
 import { saveApiKey, getApiKey, deleteApiKey, providers, getActiveProvider } from '../services/ai';
 import { dbClearHistory, dbClearTabs } from '../services/db';
-import { Settings, Cpu, Palette, Shield, Keyboard, Check, AlertCircle, RefreshCw } from 'lucide-react';
+import { Settings, Cpu, Palette, Shield, Keyboard, Check, AlertCircle, RefreshCw, Camera, Mic, Video, Volume2 } from 'lucide-react';
 
 export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const { settings, updateSettings } = useBrowserStore();
@@ -27,6 +28,75 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   
   const [testStatus, setTestStatus] = useState<'idle' | 'testing' | 'success' | 'error'>('idle');
   const [testError, setTestError] = useState('');
+
+  // Media Permissions Test State
+  const [mediaTesting, setMediaTesting] = useState(false);
+  const [mediaStatus, setMediaStatus] = useState<string | null>(null);
+  const [mediaError, setMediaError] = useState<string | null>(null);
+  const videoRef = React.useRef<HTMLVideoElement | null>(null);
+  const mediaStreamRef = React.useRef<MediaStream | null>(null);
+
+  const startMediaTest = async (mode: 'both' | 'video' | 'audio' = 'both') => {
+    setMediaTesting(true);
+    setMediaStatus(`Requesting ${mode === 'both' ? 'Camera & Microphone' : mode === 'video' ? 'Camera' : 'Microphone'} access...`);
+    setMediaError(null);
+    try {
+      const constraints = {
+        video: mode === 'both' || mode === 'video',
+        audio: mode === 'both' || mode === 'audio'
+      };
+      const stream = await navigator.mediaDevices.getUserMedia(constraints);
+      mediaStreamRef.current = stream;
+      if (videoRef.current && (mode === 'both' || mode === 'video')) {
+        videoRef.current.srcObject = stream;
+      }
+      setMediaStatus(`${mode === 'both' ? 'Camera & Microphone' : mode === 'video' ? 'Camera' : 'Microphone'} access granted successfully!`);
+    } catch (err: any) {
+      const name = err.name || '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError' || err.message?.includes('Permission denied')) {
+        setMediaError('PERMISSION_DECLINED');
+      } else if (name === 'NotFoundError' || name === 'DevicesNotFoundError') {
+        setMediaError('NO_DEVICE_FOUND');
+      } else {
+        setMediaError(err.message || String(err));
+      }
+      setMediaStatus(null);
+      setMediaTesting(false);
+    }
+  };
+
+  const stopMediaTest = () => {
+    if (mediaStreamRef.current) {
+      mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      mediaStreamRef.current = null;
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null;
+    }
+    setMediaTesting(false);
+    setMediaStatus(null);
+    setMediaError(null);
+  };
+
+  const handleResetPermissions = async () => {
+    try {
+      stopMediaTest();
+      await invoke('reset_media_permissions');
+      setNotification({ type: 'success', message: 'Saved permission decisions reset! Click Test Camera & Mic to re-prompt.' });
+      setMediaError(null);
+      setMediaStatus('Permission cache cleared. Click "Test Camera & Mic" to request permission again.');
+    } catch (e: any) {
+      setNotification({ type: 'error', message: 'Failed to reset permissions: ' + (e.message || String(e)) });
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      if (mediaStreamRef.current) {
+        mediaStreamRef.current.getTracks().forEach(track => track.stop());
+      }
+    };
+  }, []);
 
   // Load API key when selected provider changes
   useEffect(() => {
@@ -430,6 +500,108 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
                 <label htmlFor="tracking" className="text-xs font-semibold text-slate-350 cursor-pointer">
                   Enable Trackers and Ad Blocking Protection (Recommended)
                 </label>
+              </div>
+
+              {/* Camera & Microphone Media Permissions */}
+              <div className="flex flex-col gap-3 pt-4 border-t border-slate-800">
+                <div className="flex items-center gap-2">
+                  <Camera size={16} className="text-purple-400" />
+                  <Mic size={16} className="text-blue-400" />
+                  <label className="text-xs font-bold text-white">Camera & Microphone Access</label>
+                </div>
+                <p className="text-[10px] text-slate-400 leading-relaxed max-w-md">
+                  Websites and web apps loaded in Aria can access your camera and microphone via WebRTC / MediaDevices APIs. Access is granted per site prompt on HTTPS origins.
+                </p>
+
+                {/* Media Hardware Tester */}
+                <div className="p-3 bg-[#0b0f19] border border-slate-800 rounded-xl space-y-3 max-w-md">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[11px] font-semibold text-slate-300 flex items-center gap-1.5">
+                      <Video size={13} className="text-emerald-400" /> Hardware Test
+                    </span>
+                    {!mediaTesting ? (
+                      <button
+                        onClick={() => startMediaTest('both')}
+                        className="px-3 py-1.5 bg-purple-600 hover:bg-purple-500 rounded-lg text-[11px] font-semibold text-white cursor-pointer transition-all flex items-center gap-1"
+                      >
+                        <Camera size={12} /> Test Camera & Mic
+                      </button>
+                    ) : (
+                      <button
+                        onClick={stopMediaTest}
+                        className="px-3 py-1.5 bg-red-600 hover:bg-red-500 rounded-lg text-[11px] font-semibold text-white cursor-pointer transition-all"
+                      >
+                        Stop Test
+                      </button>
+                    )}
+                  </div>
+
+                  {/* Video Live Preview Box */}
+                  {mediaTesting && (
+                    <div className="relative rounded-lg overflow-hidden bg-black border border-slate-700 aspect-video flex items-center justify-center">
+                      <video
+                        ref={videoRef}
+                        autoPlay
+                        playsInline
+                        muted
+                        className="w-full h-full object-cover"
+                      />
+                      <div className="absolute bottom-2 left-2 flex items-center gap-1.5 bg-black/70 px-2 py-1 rounded text-[10px] text-emerald-400 font-mono">
+                        <Volume2 size={12} className="animate-pulse" /> Live Stream Active
+                      </div>
+                    </div>
+                  )}
+
+                  {mediaStatus && (
+                    <div className="text-[10px] text-emerald-400 font-mono bg-emerald-950/30 p-2 rounded border border-emerald-900/40">
+                      {mediaStatus}
+                    </div>
+                  )}
+
+                  {mediaError && mediaError === 'PERMISSION_DECLINED' && (
+                    <div className="p-3 bg-amber-950/30 border border-amber-800/60 rounded-lg text-amber-200 text-xs space-y-2">
+                      <div className="font-bold flex items-center gap-1.5 text-amber-400">
+                        <AlertCircle size={14} /> Camera / Mic Permission Declined
+                      </div>
+                      <p className="text-[11px] leading-relaxed text-amber-300">
+                        Permission was declined when prompted. Click below to request permission again or enable access in Windows/OS Settings.
+                      </p>
+                      
+                      <div className="flex items-center gap-2 pt-1 flex-wrap">
+                        <button
+                          onClick={handleResetPermissions}
+                          className="px-3 py-1.5 bg-amber-600 hover:bg-amber-500 text-slate-950 rounded-lg text-[11px] font-bold cursor-pointer transition-all flex items-center gap-1"
+                        >
+                          <RefreshCw size={12} /> Reset Saved Permission & Re-prompt
+                        </button>
+                        <button
+                          onClick={() => startMediaTest('video')}
+                          className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded-lg text-[11px] font-semibold cursor-pointer transition-all"
+                        >
+                          Camera Only
+                        </button>
+                        <button
+                          onClick={() => startMediaTest('audio')}
+                          className="px-2.5 py-1.5 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded-lg text-[11px] font-semibold cursor-pointer transition-all"
+                        >
+                          Mic Only
+                        </button>
+                      </div>
+
+                      <div className="text-[10px] text-slate-400 border-t border-amber-900/50 pt-2 space-y-1">
+                        <div className="font-bold text-slate-300">Windows OS Permission Reset:</div>
+                        <div>1. Open Windows <b>Settings</b> → <b>Privacy & security</b> → <b>Camera</b> (and <b>Microphone</b>).</div>
+                        <div>2. Ensure <i>"Let desktop apps access your camera"</i> is turned <b>ON</b>.</div>
+                      </div>
+                    </div>
+                  )}
+
+                  {mediaError && mediaError !== 'PERMISSION_DECLINED' && (
+                    <div className="text-[10px] text-red-400 font-mono bg-red-950/30 p-2 rounded border border-red-900/40">
+                      {mediaError}
+                    </div>
+                  )}
+                </div>
               </div>
 
               {/* Clear data */}

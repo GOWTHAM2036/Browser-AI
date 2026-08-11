@@ -44,7 +44,7 @@ interface BrowserState {
   setReaderModeActive: (active: boolean) => void;
   setAskAiActive: (active: boolean) => void;
   updateWindowSize: (width: number, height: number) => Promise<void>;
-  
+
   // Navigation
   navigateActiveTab: (url: string) => Promise<void>;
   goBackActiveTab: () => Promise<void>;
@@ -55,7 +55,7 @@ interface BrowserState {
   addHistoryEntry: (url: string, title: string) => Promise<void>;
   addBookmarkEntry: (url: string, title: string, favicon?: string) => Promise<void>;
   deleteBookmarkEntry: (id: string) => Promise<void>;
-  
+
   // Reading List
   addReadingItem: (url: string, title: string, excerpt?: string) => Promise<void>;
   toggleReadingItemRead: (id: string, read: boolean) => Promise<void>;
@@ -82,7 +82,7 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
   const getWebviewBounds = (state: BrowserState) => {
     const topChromeHeight = 80; // 36px titlebar + 44px navigation bar
     const sidebarWidth = state.sidebarOpen ? state.sidebarWidth : 0;
-    
+
     let x = 0;
     let width = state.windowWidth;
 
@@ -145,7 +145,7 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
       const history = await dbGetHistory();
       const bookmarks = await dbGetBookmarks();
       const readingList = await dbGetReadingList();
-      
+
       set({ history, bookmarks, readingList });
 
       // 3. Load saved tabs session
@@ -202,7 +202,7 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
       if (!tabToClose) return;
 
       const remainingTabs = tabs.filter(t => t.id !== id).map((t, idx) => ({ ...t, position: idx }));
-      
+
       // Destroy backend webview
       try {
         await invoke('destroy_tab_webview', { webviewLabel: `tab-${id}` });
@@ -399,10 +399,10 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
       const updatedSettings = { ...get().settings, ...updates };
       set({ settings: updatedSettings });
       localStorage.setItem('aria_settings', JSON.stringify(updatedSettings));
-      
+
       // Apply theme class
       document.documentElement.classList.toggle('dark', updatedSettings.theme === 'dark' || (updatedSettings.theme === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches));
-      
+
       // Trigger size sync in case layout constraints changed
       syncActiveWebviewLayout(get() as BrowserState);
     }

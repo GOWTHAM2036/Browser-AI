@@ -103,6 +103,9 @@ async fn create_tab_webview(
             for (key, val) in url.query_pairs() {
                 if key == "payload" {
                     let payload_val = val.into_owned();
+                    // Diagnostic: log IPC payloads arriving on the Rust side
+                    let preview: String = payload_val.chars().take(120).collect();
+                    println!("[TAURI IPC] Payload received for {}: {}...", webview_label_clone, preview);
                     let event_name = format!("page-content-{}", webview_label_clone);
                     let _ = app_handle_clone.emit(
                         &event_name,
@@ -218,16 +221,21 @@ async fn navigate_tab_webview(
 }
 
 #[tauri::command]
-async fn eval_tab_webview(
+fn eval_tab_webview(
     app_handle: tauri::AppHandle,
     webview_label: String,
     js: String,
 ) -> Result<(), String> {
+    let js_preview: String = js.chars().take(80).collect();
+    println!("[TAURI EVAL] Injecting JS into '{}': {}...", webview_label, js_preview.replace('\n', " "));
     if let Some(webview) = app_handle.get_webview(&webview_label) {
         webview.eval(&js).map_err(|e| {
+            println!("[TAURI EVAL] ERROR injecting into '{}': {}", webview_label, e);
             e.to_string()
         })?;
+        println!("[TAURI EVAL] SUCCESS injection into '{}'", webview_label);
     } else {
+        println!("[TAURI EVAL] WEBVIEW_NOT_FOUND '{}'", webview_label);
         return Err(format!("Webview '{}' not found", webview_label));
     }
     Ok(())
@@ -281,6 +289,17 @@ fn delete_credential(service: String, username: String) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn reset_media_permissions(app_handle: tauri::AppHandle) -> Result<(), String> {
+    if let Ok(data_dir) = app_handle.path().app_data_dir() {
+        let sessions_dir = data_dir.join("aria_sessions");
+        if sessions_dir.exists() {
+            let _ = std::fs::remove_dir_all(&sessions_dir);
+        }
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -302,7 +321,8 @@ pub fn run() {
             save_credential,
             get_credential,
             delete_credential,
-            log_from_frontend
+            log_from_frontend,
+            reset_media_permissions
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
