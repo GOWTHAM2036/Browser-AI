@@ -30,54 +30,70 @@ export function buildExecutionScript(
 
     console.log('[ARIA_EXEC] START action=' + actionType + ' elementId=' + elementId);
 
-    // ---- IPC result reporter ----
-    // CRITICAL FIX: Delay the location.href navigation by 50ms so that
-    // all synchronous DOM event dispatching and framework state updates
-    // complete before we trigger the IPC navigation. Without this delay,
-    // the location.href fires immediately after event dispatch, which can
-    // cancel/undo pending DOM events and tear down the page context on
-    // WebView2 before the page has time to process the synthetic events.
+    // --- Inject In-Page CSS Animation Styles if needed ---
+    if (!document.getElementById('aria-inpage-styles')) {
+      var styleEl = document.createElement('style');
+      styleEl.id = 'aria-inpage-styles';
+      styleEl.textContent = \`
+        @keyframes ariaCursorPulse {
+          0% { transform: scale(1); box-shadow: 0 0 8px #22d3ee; }
+          50% { transform: scale(1.3); box-shadow: 0 0 16px #38bdf8, 0 0 24px #818cf8; }
+          100% { transform: scale(1); box-shadow: 0 0 8px #22d3ee; }
+        }
+        @keyframes ariaRippleWave {
+          0% { transform: scale(0.2); opacity: 1; }
+          100% { transform: scale(2.2); opacity: 0; }
+        }
+        @keyframes ariaGlowOutline {
+          0%, 100% { box-shadow: 0 0 12px rgba(168,85,247,0.7), inset 0 0 6px rgba(168,85,247,0.3); }
+          50% { box-shadow: 0 0 20px rgba(168,85,247,0.95), inset 0 0 12px rgba(168,85,247,0.5); }
+        }
+        @keyframes ariaBlink {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0; }
+        }
+      \`;
+      document.head.appendChild(styleEl);
+    }
+
+    // --- IPC result reporter ---
     var result = function(data) {
-      // Stash on window as fallback in case IPC navigation fails
       try { window.__ARIA_AGENT_RESULT__ = data; } catch(e) {}
       var payloadStr = JSON.stringify(data);
       console.log('[ARIA_EXEC] RESULT_READY payload=' + payloadStr);
       setTimeout(function() {
         console.log('[ARIA_EXEC] IPC_SEND via location.href');
         location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent('ARIA_AGENT_RESULT:' + payloadStr);
-      }, 50);
+      }, 10);
     };
-    
+
     // 1. Resolve Target Element
     var el = null;
     if (elementId) {
       el = document.querySelector('[aria-agent-id="' + elementId + '"]');
-      console.log('[ARIA_EXEC] SELECTOR_QUERY aria-agent-id="' + elementId + '" found=' + !!el);
     }
-    
+
     // Fallback 1: Geometric Center Point Query
     if (!el && targetRect && typeof targetRect.x === 'number' && typeof targetRect.y === 'number') {
       var cx = Math.round(targetRect.x + (targetRect.width || 0) / 2);
       var cy = Math.round(targetRect.y + (targetRect.height || 0) / 2);
       if (cx >= 0 && cy >= 0 && cx <= window.innerWidth && cy <= window.innerHeight) {
         el = document.elementFromPoint(cx, cy);
-        console.log('[ARIA_EXEC] FALLBACK_GEOMETRIC cx=' + cx + ' cy=' + cy + ' found=' + !!el + ' tag=' + (el ? el.tagName : 'N/A'));
       }
     }
 
     // Fallback 2: Candidate search by element_id attribute
     if (!el && elementId) {
-      var candidates = document.querySelectorAll('button, a, input, textarea, select, [role="button"], [role="link"], [role="textbox"]');
+      var candidates = document.querySelectorAll('button, a, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="searchbox"]');
       for (var i = 0; i < candidates.length; i++) {
         if (candidates[i].getAttribute('aria-agent-id') === elementId) {
           el = candidates[i];
-          console.log('[ARIA_EXEC] FALLBACK_CANDIDATE found at index=' + i);
           break;
         }
       }
     }
 
-    if (!el && ['click', 'type', 'press', 'select'].includes(actionType)) {
+    if (!el && ['click', 'type', 'type_and_submit', 'press', 'select'].includes(actionType)) {
       throw new Error('Element not found in DOM or at coordinates for action: ' + actionType + ' (id: ' + elementId + ')');
     }
 
@@ -85,12 +101,160 @@ export function buildExecutionScript(
       throw new Error('Element ' + elementId + ' is disabled');
     }
 
-    console.log('[ARIA_EXEC] ELEMENT_RESOLVED tag=' + (el ? el.tagName : 'null') + ' action=' + actionType);
+    // Ensure element is visible in viewport
+    if (el) {
+      try { el.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: 'instant' }); } catch(e) {}
+    }
 
-    // Calculate center coordinates for pointer events
+    // Calculate center coordinates
     var rect = el ? el.getBoundingClientRect() : null;
-    var clientX = rect ? Math.round(rect.left + rect.width / 2) : (targetRect ? Math.round(targetRect.x + targetRect.width / 2) : 0);
-    var clientY = rect ? Math.round(rect.top + rect.height / 2) : (targetRect ? Math.round(targetRect.y + targetRect.height / 2) : 0);
+    var clientX = rect ? Math.round(rect.left + rect.width / 2) : (targetRect ? Math.round(targetRect.x + targetRect.width / 2) : Math.round(window.innerWidth / 2));
+    var clientY = rect ? Math.round(rect.top + rect.height / 2) : (targetRect ? Math.round(targetRect.y + targetRect.height / 2) : Math.round(window.innerHeight / 3));
+
+    // Retrieve previous cursor coordinates for smooth gliding
+    var prevPos = window.__ARIA_AGENT_CURSOR_POS__ || { x: Math.round(window.innerWidth / 2), y: Math.round(window.innerHeight / 2) };
+    window.__ARIA_AGENT_CURSOR_POS__ = { x: clientX, y: clientY };
+
+    // --- IN-PAGE LIVE AGENT VISUAL OVERLAY ENGINE (NON-BLOCKING) ---
+    var renderInPageCursor = function(badgeText, actionIcon) {
+      try {
+        var cursorEl = document.getElementById('aria-inpage-agent-cursor');
+        if (!cursorEl) {
+          cursorEl = document.createElement('div');
+          cursorEl.id = 'aria-inpage-agent-cursor';
+          cursorEl.style.cssText = 'position:fixed;top:0;left:0;z-index:2147483647;pointer-events:none;transform:translate(' + prevPos.x + 'px, ' + prevPos.y + 'px);transition:transform 0.28s cubic-bezier(0.2, 0.9, 0.3, 1);will-change:transform;';
+          
+          cursorEl.innerHTML = \`
+            <div style="position:relative;display:flex;align-items:flex-start;">
+              <!-- Custom SVG Pointer -->
+              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" style="filter:drop-shadow(0 3px 8px rgba(0,0,0,0.85));">
+                <path d="M3 3L10.07 20.97L13.58 13.58L20.97 10.07L3 3Z" fill="url(#aria-cursor-grad)" stroke="#ffffff" stroke-width="1.5" stroke-linejoin="round" />
+                <defs>
+                  <linearGradient id="aria-cursor-grad" x1="3" y1="3" x2="21" y2="21" gradientUnits="userSpaceOnUse">
+                    <stop stop-color="#8b5cf6" />
+                    <stop offset="1" stop-color="#06b6d4" />
+                  </linearGradient>
+                </defs>
+              </svg>
+              <!-- Glowing Pulse Node on Tip -->
+              <div style="position:absolute;top:-2px;left:-2px;width:7px;height:7px;border-radius:50%;background:#22d3ee;box-shadow:0 0 10px #22d3ee;animation:ariaCursorPulse 1.2s infinite ease-in-out;"></div>
+              
+              <!-- Floating Live Action Pill Badge -->
+              <div id="aria-cursor-badge" style="margin-left:14px;margin-top:2px;background:rgba(15,23,42,0.94);color:#f8fafc;border:1.5px solid rgba(168,85,247,0.8);border-radius:8px;padding:4px 10px;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;font-size:11px;font-weight:600;white-space:nowrap;box-shadow:0 6px 20px rgba(0,0,0,0.7),0 0 12px rgba(168,85,247,0.4);backdrop-filter:blur(8px);display:flex;align-items:center;gap:6px;transition:all 0.2s ease;">
+                <span id="aria-badge-icon" style="font-size:12px;">\${actionIcon || '⚡'}</span>
+                <span id="aria-badge-text">\${badgeText || 'ARIA Agent'}</span>
+              </div>
+            </div>
+          \`;
+          document.body.appendChild(cursorEl);
+        } else {
+          var badgeEl = document.getElementById('aria-badge-text');
+          var iconEl = document.getElementById('aria-badge-icon');
+          if (badgeEl) badgeEl.textContent = badgeText || 'ARIA Agent';
+          if (iconEl) iconEl.textContent = actionIcon || '⚡';
+        }
+
+        // Animate cursor to target position asynchronously
+        requestAnimationFrame(function() {
+          if (cursorEl) {
+            cursorEl.style.transform = 'translate(' + (clientX - 2) + 'px, ' + (clientY - 2) + 'px)';
+          }
+        });
+
+        // Target Element Highlight Box
+        if (el && rect) {
+          var hl = document.getElementById('aria-inpage-highlight');
+          if (!hl) {
+            hl = document.createElement('div');
+            hl.id = 'aria-inpage-highlight';
+            hl.style.cssText = 'position:fixed;z-index:2147483646;pointer-events:none;border:2px solid #a855f7;border-radius:6px;animation:ariaGlowOutline 1.5s infinite ease-in-out;transition:all 0.2s ease-out;';
+            document.body.appendChild(hl);
+          }
+          hl.style.left = Math.max(0, rect.left - 3) + 'px';
+          hl.style.top = Math.max(0, rect.top - 3) + 'px';
+          hl.style.width = (rect.width + 6) + 'px';
+          hl.style.height = (rect.height + 6) + 'px';
+          hl.style.opacity = '1';
+        }
+      } catch(err) {}
+    };
+
+    // Helper: Trigger Click Ripple
+    var triggerClickRipple = function(x, y) {
+      try {
+        var ripple = document.createElement('div');
+        ripple.style.cssText = 'position:fixed;left:' + (x - 20) + 'px;top:' + (y - 20) + 'px;width:40px;height:40px;border-radius:50%;background:rgba(168,85,247,0.5);border:2px solid #c084fc;box-shadow:0 0 16px #a855f7;z-index:2147483647;pointer-events:none;animation:ariaRippleWave 0.45s ease-out forwards;';
+        document.body.appendChild(ripple);
+        setTimeout(function() { if (ripple.parentNode) ripple.parentNode.removeChild(ripple); }, 500);
+      } catch(e) {}
+    };
+
+    // Fast, framework-compatible value setter
+    var applyInputValue = function(targetEl, text) {
+      if (!targetEl) return;
+      if (typeof targetEl.focus === 'function') {
+        try { targetEl.focus({ preventScroll: true }); } catch(e) {}
+      }
+
+      var isContentEditable = targetEl.isContentEditable;
+      var isTextArea = targetEl instanceof HTMLTextAreaElement;
+      var proto = isTextArea ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
+      var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+
+      if (isContentEditable) {
+        targetEl.textContent = text;
+      } else if (descriptor && descriptor.set) {
+        descriptor.set.call(targetEl, text);
+      } else {
+        targetEl.value = text;
+      }
+
+      try {
+        targetEl.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, composed: true, inputType: 'insertText', data: text }));
+      } catch(e) {
+        try { targetEl.dispatchEvent(new Event('input', { bubbles: true, cancelable: true, composed: true })); } catch(err) {}
+      }
+      try { targetEl.dispatchEvent(new Event('change', { bubbles: true, cancelable: true, composed: true })); } catch(e) {}
+    };
+
+    // Helper: Submit Search or Form
+    var submitSearchElement = function(targetEl) {
+      if (!targetEl) return;
+      var keyInit = { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true, composed: true };
+
+      try { targetEl.dispatchEvent(new KeyboardEvent('keydown', keyInit)); } catch(e) {}
+      try { targetEl.dispatchEvent(new KeyboardEvent('keypress', keyInit)); } catch(e) {}
+      try { targetEl.dispatchEvent(new KeyboardEvent('keyup', keyInit)); } catch(e) {}
+
+      var form = targetEl.form || (targetEl.tagName === 'FORM' ? targetEl : (targetEl.closest ? targetEl.closest('form') : null));
+      if (form) {
+        try {
+          if (typeof form.requestSubmit === 'function') {
+            form.requestSubmit();
+          } else if (typeof form.submit === 'function') {
+            form.submit();
+          }
+        } catch(e) {}
+      }
+
+      // Adjacent search button click fallback
+      var searchBtn = document.querySelector('#search-icon-legacy, button[aria-label="Search"], button[aria-label="search"], button[type="submit"], input[type="submit"]');
+      if (searchBtn && typeof searchBtn.click === 'function') {
+        try { searchBtn.click(); } catch(e) {}
+      }
+
+      // YouTube specific search redirection
+      if (location.hostname.includes('youtube.com') && targetEl && (targetEl.id === 'search' || targetEl.name === 'search_query')) {
+        var q = targetEl.value;
+        if (q) {
+          setTimeout(function() {
+            if (!location.href.includes('/results?search_query=')) {
+              location.href = 'https://www.youtube.com/results?search_query=' + encodeURIComponent(q);
+            }
+          }, 100);
+        }
+      }
+    };
 
     var eventInit = {
       bubbles: true,
@@ -106,42 +270,19 @@ export function buildExecutionScript(
       buttons: 1
     };
 
-    // Helper: Inject temporary visual feedback overlay into DOM
-    var showVisualFeedback = function(type, x, y, targetEl) {
-      try {
-        if (type === 'click') {
-          var ripple = document.createElement('div');
-          ripple.style.cssText = 'position:fixed;left:' + (x - 16) + 'px;top:' + (y - 16) + 'px;width:32px;height:32px;border-radius:50%;background:rgba(168,85,247,0.7);border:2px solid #c084fc;box-shadow:0 0 15px #a855f7;z-index:2147483647;pointer-events:none;transform:scale(0.3);transition:transform 0.4s ease-out, opacity 0.4s ease-out;opacity:1;';
-          document.body.appendChild(ripple);
-          requestAnimationFrame(function() {
-            ripple.style.transform = 'scale(1.8)';
-            ripple.style.opacity = '0';
-          });
-          setTimeout(function() { if (ripple.parentNode) ripple.parentNode.removeChild(ripple); }, 450);
-        } else if (type === 'type' && targetEl) {
-          var r = targetEl.getBoundingClientRect();
-          var overlay = document.createElement('div');
-          overlay.style.cssText = 'position:fixed;left:' + r.left + 'px;top:' + r.top + 'px;width:' + r.width + 'px;height:' + r.height + 'px;border:2px solid #3b82f6;box-shadow:0 0 12px rgba(59,130,246,0.8);border-radius:4px;z-index:2147483647;pointer-events:none;transition:all 0.4s ease-out;opacity:1;';
-          document.body.appendChild(overlay);
-          setTimeout(function() {
-            overlay.style.opacity = '0';
-            setTimeout(function() { if (overlay.parentNode) overlay.parentNode.removeChild(overlay); }, 200);
-          }, 450);
-        }
-      } catch(e) {}
-    };
+    var targetName = el ? (el.getAttribute('aria-label') || el.innerText || el.placeholder || el.name || el.tagName).trim().slice(0, 28) : (elementId || '');
 
-    // 2. Execute Action Types
+    // 2. Execute Action Types with Fast DOM Execution & Non-blocking Visuals
     switch (actionType) {
       case 'click': {
+        renderInPageCursor('Clicking ' + (targetName || 'element'), '🖱️');
         if (el) {
-          try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch(e) {}
           if (typeof el.focus === 'function') {
             try { el.focus({ preventScroll: true }); } catch(e) {}
           }
-          showVisualFeedback('click', clientX, clientY, el);
-          
-          console.log('[ARIA_EXEC] CLICK_DISPATCH pointer+mouse events at (' + clientX + ',' + clientY + ')');
+          triggerClickRipple(clientX, clientY);
+
+          // Dispatch full synthetic event stream
           if (window.PointerEvent) {
             try { el.dispatchEvent(new PointerEvent('pointerdown', eventInit)); } catch(e) {}
           }
@@ -157,101 +298,77 @@ export function buildExecutionScript(
           if (typeof el.click === 'function') {
             try { el.click(); } catch(e) {}
           }
-          console.log('[ARIA_EXEC] CLICK_COMPLETE element=' + elementId);
+
+          // If it is a link with href, trigger navigation fallback
+          var href = el.href || el.getAttribute('href');
+          if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
+            try {
+              if (href.startsWith('/')) href = location.origin + href;
+              setTimeout(function() {
+                if (location.href !== href && !location.href.includes(href)) {
+                  location.href = href;
+                }
+              }, 120);
+            } catch(e) {}
+          }
         }
         result({ success: true, action: 'click', element_id: elementId, elementId: elementId });
         break;
       }
 
       case 'type': {
-        if (!el) throw new Error('Target element missing for type action');
-        try { el.scrollIntoView({ block: 'center', inline: 'center' }); } catch(e) {}
-        try { el.dispatchEvent(new Event('focus', { bubbles: true, cancelable: true, composed: true })); } catch(e) {}
-        if (typeof el.focus === 'function') {
-          try { el.focus({ preventScroll: true }); } catch(e) {}
+        renderInPageCursor('Typing: "' + textToType.slice(0, 22) + '"', '⌨️');
+        if (!el) {
+          result({ success: false, action: 'type', error: 'Target element missing for type action' });
+          return;
         }
 
-        showVisualFeedback('type', clientX, clientY, el);
-        console.log('[ARIA_EXEC] TYPE_START text="' + textToType + '" isContentEditable=' + el.isContentEditable);
-
-        if (el.isContentEditable) {
-          el.textContent = textToType;
-          try {
-            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, composed: true, inputType: 'insertText', data: textToType }));
-            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true, composed: true }));
-          } catch(e) {}
-        } else {
-          var isTextArea = el instanceof HTMLTextAreaElement;
-          var proto = isTextArea ? window.HTMLTextAreaElement.prototype : window.HTMLInputElement.prototype;
-          var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
-
-          if (descriptor && descriptor.set) {
-            descriptor.set.call(el, textToType);
-            console.log('[ARIA_EXEC] TYPE_SETTER used native prototype descriptor');
-          } else {
-            el.value = textToType;
-            console.log('[ARIA_EXEC] TYPE_SETTER used direct .value assignment');
-          }
-
-          try {
-            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, composed: true, inputType: 'insertText', data: textToType }));
-          } catch(e) {
-            el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true, composed: true }));
-          }
-
-          try {
-            el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true, composed: true }));
-          } catch(e) {}
-        }
-
-        try { el.dispatchEvent(new Event('blur', { bubbles: true, cancelable: true, composed: true })); } catch(e) {}
-        console.log('[ARIA_EXEC] TYPE_COMPLETE element=' + elementId + ' newValue="' + (el.value || el.textContent || '') + '"');
+        applyInputValue(el, textToType);
         result({ success: true, action: 'type', element_id: elementId, elementId: elementId });
         break;
       }
 
+      case 'type_and_submit': {
+        renderInPageCursor('Searching: "' + textToType.slice(0, 22) + '" ↵', '🔍');
+        if (!el) {
+          result({ success: false, action: 'type_and_submit', error: 'Target element missing for type_and_submit action' });
+          return;
+        }
+
+        applyInputValue(el, textToType);
+        submitSearchElement(el);
+        result({ success: true, action: 'type_and_submit', element_id: elementId, elementId: elementId });
+        break;
+      }
+
       case 'press': {
-        var keyCode = key === 'ENTER' || key === 'Enter' ? 13 : 0;
         var keyName = key === 'ENTER' ? 'Enter' : key;
-        var keyInit = { key: keyName, code: keyName === 'Enter' ? 'Enter' : keyName, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true };
-
+        renderInPageCursor('Pressing [' + keyName + ' ↵]', '↵');
         var targetNode = el || (document.activeElement && document.activeElement !== document.body ? document.activeElement : document.body);
-
-        console.log('[ARIA_EXEC] PRESS_START key=' + keyName + ' targetTag=' + targetNode.tagName);
 
         if (typeof targetNode.focus === 'function') {
           try { targetNode.focus({ preventScroll: true }); } catch(e) {}
         }
 
-        try { targetNode.dispatchEvent(new KeyboardEvent('keydown', keyInit)); } catch(e) {}
-        try { targetNode.dispatchEvent(new KeyboardEvent('keypress', keyInit)); } catch(e) {}
-        try { targetNode.dispatchEvent(new KeyboardEvent('keyup', keyInit)); } catch(e) {}
-
         if (keyName === 'Enter') {
-          var form = targetNode.form || (targetNode.tagName === 'FORM' ? targetNode : (targetNode.closest ? targetNode.closest('form') : null));
-          if (form) {
-            console.log('[ARIA_EXEC] PRESS_FORM_SUBMIT formAction=' + (form.action || 'default'));
-            try {
-              if (typeof form.requestSubmit === 'function') {
-                form.requestSubmit();
-              } else if (typeof form.submit === 'function') {
-                form.submit();
-              }
-            } catch(e) {
-              console.log('[ARIA_EXEC] PRESS_FORM_SUBMIT_ERROR ' + e);
-            }
-          } else {
-            console.log('[ARIA_EXEC] PRESS_NO_FORM found for Enter key');
-          }
+          submitSearchElement(targetNode);
+        } else {
+          var keyCode = 0;
+          var keyInit = { key: keyName, code: keyName, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true, composed: true };
+          try { targetNode.dispatchEvent(new KeyboardEvent('keydown', keyInit)); } catch(e) {}
+          try { targetNode.dispatchEvent(new KeyboardEvent('keypress', keyInit)); } catch(e) {}
+          try { targetNode.dispatchEvent(new KeyboardEvent('keyup', keyInit)); } catch(e) {}
         }
-        console.log('[ARIA_EXEC] PRESS_COMPLETE key=' + keyName);
+
         result({ success: true, action: 'press', element_id: elementId, elementId: elementId });
         break;
       }
 
       case 'select': {
+        renderInPageCursor('Selecting option: ' + value, '📋');
         if (!el || !(el instanceof HTMLSelectElement)) {
-          throw new Error('Target element is not a select element');
+          result({ success: false, action: 'select', error: 'Target element is not a select element' });
+          return;
         }
         var protoSel = window.HTMLSelectElement.prototype;
         var descSel = Object.getOwnPropertyDescriptor(protoSel, 'value');
@@ -264,38 +381,30 @@ export function buildExecutionScript(
           el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true, composed: true }));
           el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true, composed: true }));
         } catch(e) {}
-        console.log('[ARIA_EXEC] SELECT_COMPLETE element=' + elementId + ' value=' + value);
         result({ success: true, action: 'select', element_id: elementId, elementId: elementId });
         break;
       }
 
       case 'scroll': {
+        renderInPageCursor('Scrolling ' + direction, direction === 'up' ? '⬆' : '⬇');
         var scrollY = (direction === 'up' ? -1 : 1) * amount;
-        console.log('[ARIA_EXEC] SCROLL_START direction=' + direction + ' amount=' + amount);
-
         if (el && typeof el.scrollBy === 'function') {
-          try { el.scrollBy({ top: scrollY, behavior: 'smooth' }); } catch(e) {}
+          try { el.scrollBy({ top: scrollY, behavior: 'instant' }); } catch(e) {}
         } else {
-          try { window.scrollBy({ top: scrollY, behavior: 'smooth' }); } catch(e) {}
+          try { window.scrollBy({ top: scrollY, behavior: 'instant' }); } catch(e) {}
           if (document.scrollingElement && typeof document.scrollingElement.scrollBy === 'function') {
-            try { document.scrollingElement.scrollBy({ top: scrollY, behavior: 'smooth' }); } catch(e) {}
-          }
-          if (document.documentElement && typeof document.documentElement.scrollBy === 'function') {
-            try { document.documentElement.scrollBy({ top: scrollY, behavior: 'smooth' }); } catch(e) {}
-          }
-          if (document.body && typeof document.body.scrollBy === 'function') {
-            try { document.body.scrollBy({ top: scrollY, behavior: 'smooth' }); } catch(e) {}
+            try { document.scrollingElement.scrollBy({ top: scrollY, behavior: 'instant' }); } catch(e) {}
           }
         }
-        console.log('[ARIA_EXEC] SCROLL_COMPLETE');
         result({ success: true, action: 'scroll' });
         break;
       }
 
-      default:
-        console.log('[ARIA_EXEC] DEFAULT_ACTION actionType=' + actionType);
+      default: {
+        renderInPageCursor('Executing ' + actionType, '⚡');
         result({ success: true, action: actionType });
         break;
+      }
     }
   } catch (err) {
     var errorMsg = String(err && err.message ? err.message : err);
@@ -305,12 +414,10 @@ export function buildExecutionScript(
       action: typeof rawAction !== 'undefined' && rawAction ? (rawAction.action || rawAction.type || 'unknown') : 'unknown',
       error: errorMsg
     });
-    // Stash error result as fallback
     try { window.__ARIA_AGENT_RESULT__ = JSON.parse(payloadStr); } catch(e) {}
-    // Same delayed IPC for errors
     setTimeout(function() {
       location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent('ARIA_AGENT_RESULT:' + payloadStr);
-    }, 50);
+    }, 10);
   }
 })();
   `;

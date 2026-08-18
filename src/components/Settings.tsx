@@ -117,8 +117,11 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
     if (provider) {
       const models = await provider.listModels();
       setAvailableModels(models);
-      if (models.length > 0 && !models.includes(selectedModel)) {
-        setSelectedModel(models[0]);
+      if (models.length > 0) {
+        const isCurrentValid = models.includes(selectedModel);
+        const modelToSet = isCurrentValid ? selectedModel : models[0];
+        setSelectedModel(modelToSet);
+        updateSettings({ aiProvider: providerId, aiModel: modelToSet });
       }
     } else {
       setAvailableModels([]);

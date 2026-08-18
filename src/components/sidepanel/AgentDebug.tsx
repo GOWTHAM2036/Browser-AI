@@ -1,5 +1,6 @@
 import React from 'react';
-import { Bug } from 'lucide-react';
+import { Bug, Sparkles } from 'lucide-react';
+import { useAgentCursorStore } from '../../store/agentCursorStore';
 
 interface DebugValidationResult {
   success: boolean;
@@ -25,6 +26,8 @@ export const AgentDebug: React.FC<AgentDebugProps> = ({
   rawLlmResponse,
   onClear
 }) => {
+  const { debugMode, setDebugMode } = useAgentCursorStore();
+
   return (
     <div className="flex-1 flex flex-col min-h-0 space-y-3 overflow-y-auto pr-1">
       <div className="flex items-center justify-between border-b border-slate-800 pb-2">
@@ -32,12 +35,26 @@ export const AgentDebug: React.FC<AgentDebugProps> = ({
           <Bug size={14} className="text-purple-400 animate-pulse" />
           <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">Agent Debugger</span>
         </div>
-        <button
-          onClick={onClear}
-          className="text-[9px] text-slate-500 hover:text-slate-300 transition-all border border-slate-800 bg-[#0f172a] py-0.5 px-2 rounded cursor-pointer"
-        >
-          Clear Debug
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            onClick={() => setDebugMode(!debugMode)}
+            className={`text-[9px] font-bold py-0.5 px-2 rounded cursor-pointer transition-all border flex items-center gap-1 ${
+              debugMode
+                ? 'bg-purple-900/60 text-purple-200 border-purple-600/60'
+                : 'bg-slate-900 text-slate-400 border-slate-800 hover:text-slate-200'
+            }`}
+            title="Toggle Agent Cursor Debug HUD"
+          >
+            <Sparkles size={10} />
+            <span>Cursor HUD: {debugMode ? 'ON' : 'OFF'}</span>
+          </button>
+          <button
+            onClick={onClear}
+            className="text-[9px] text-slate-500 hover:text-slate-300 transition-all border border-slate-800 bg-[#0f172a] py-0.5 px-2 rounded cursor-pointer"
+          >
+            Clear Debug
+          </button>
+        </div>
       </div>
 
       {/* Validation Result Status */}
