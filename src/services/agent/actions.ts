@@ -2,6 +2,7 @@ export type AgentAction =
   | { action: 'navigate'; url: string; target?: 'current_tab' | 'new_tab' }
   | { action: 'click'; element_id: string }
   | { action: 'type'; element_id: string; text: string }
+  | { action: 'type_and_submit'; element_id: string; text: string }
   | { action: 'press'; element_id?: string; key: string }
   | { action: 'select'; element_id: string; value: string }
   | { action: 'scroll'; direction?: 'up' | 'down'; amount?: number }
@@ -14,6 +15,7 @@ const actionSet = new Set<string>([
   'navigate',
   'click',
   'type',
+  'type_and_submit',
   'press',
   'press_key',
   'select',
@@ -65,6 +67,9 @@ export function validateAgentAction(value: unknown): { success: true; data: Agen
     case 'type':
       if (!hasText('element_id') || !hasText('text')) return { success: false, error: 'type action requires element_id and text' };
       break;
+    case 'type_and_submit':
+      if (!hasText('element_id') || !hasText('text')) return { success: false, error: 'type_and_submit action requires element_id and text' };
+      break;
     case 'press':
       if (!hasText('key')) return { success: false, error: 'press action requires key' };
       break;
@@ -85,4 +90,3 @@ export function validateAgentAction(value: unknown): { success: true; data: Agen
   console.log(`[AGENT ACTIONS] VALIDATED action=${raw.action}`);
   return { success: true, data: raw as unknown as AgentAction };
 }
-

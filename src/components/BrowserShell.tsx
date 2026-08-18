@@ -5,6 +5,7 @@ import { Omnibox } from './Omnibox';
 import { SidePanel } from './SidePanel';
 import { ReaderMode } from './ReaderMode';
 import { SettingsUI } from './Settings';
+import { AgentCursor } from './agent/AgentCursor';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, Event } from '@tauri-apps/api/event';
@@ -369,7 +370,7 @@ export const BrowserShell: React.FC = () => {
         {/* Content Box: Reserves space for Webview, overlays overlays */}
         <div className="flex-1 h-full relative overflow-hidden bg-black">
           {/* Webview Position Marker */}
-          <div ref={containerRef} className="w-full h-full" />
+          <div ref={containerRef} id="aria-webview-container" className="w-full h-full" />
 
           {/* Reader Mode Overlay */}
           <ReaderMode />
@@ -381,6 +382,9 @@ export const BrowserShell: React.FC = () => {
         {/* AI Side Panel */}
         <SidePanel />
       </div>
+
+      {/* ARIA Agent Visual Cursor & Target Highlight Overlay */}
+      <AgentCursor />
     </div>
   );
 };

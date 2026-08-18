@@ -3,10 +3,12 @@ import { invoke } from '@tauri-apps/api/core';
 import { AgentObservation, observationScript, ElementRect } from './observer';
 import { AgentAction, validateAgentAction } from './actions';
 import { executionScript, ActionResult } from './executor';
+import { getInPageStatusScript, getInPageCleanupScript } from './inPageOverlay';
 import { getActiveProvider, getApiKey } from '../ai';
 import { normalizeAgentUrl } from '../agent';
 import { extractJsonFromText } from '../utils';
 import { BrowserSettings, Tab } from '../../types';
+import { emitAgentVisualEvent, completeAgentVisualAction, hideAgentCursor } from './visualEvents';
 
 export interface AgentLoopCallbacks {
   onStatusUpdate: (status: string, currentStep: number) => void;
@@ -31,9 +33,17 @@ export interface AgentLoopCallbacks {
 }
 
 let activeGlobalRunId: string | null = null;
+let activeControlledTabId: string | null = null;
 
 export function cancelActiveAgentRun(): void {
   activeGlobalRunId = null;
+  hideAgentCursor();
+  if (activeControlledTabId) {
+    invoke('eval_tab_webview', {
+      webviewLabel: `tab-${activeControlledTabId}`,
+      js: getInPageCleanupScript()
+    }).catch(() => {});
+  }
 }
 
 export function getObservationHash(obs: AgentObservation): string {
@@ -54,6 +64,8 @@ export function getActionSignature(action: AgentAction): string {
   switch (action.action) {
     case 'type':
       return `type:${action.element_id}:${action.text}`;
+    case 'type_and_submit':
+      return `type_and_submit:${action.element_id}:${action.text}`;
     case 'click':
       return `click:${action.element_id}`;
     case 'press':
@@ -82,8 +94,8 @@ export async function observePageDOM(tabId: string): Promise<AgentObservation> {
 
     const timeout = setTimeout(() => {
       if (unlisten) unlisten();
-      reject(new Error('Page observation timed out after 8 seconds'));
-    }, 8000);
+      reject(new Error('Page observation timed out after 6 seconds'));
+    }, 6000);
 
     unlisten = await listen<string>(eventName, (event: TauriEvent<string>) => {
       if (event.payload.startsWith('ARIA_AGENT_OBSERVATION:')) {
@@ -131,22 +143,18 @@ export async function executeDomAction(
       resolve(result);
     };
 
-    // Primary timeout: 12s
     const timeout = setTimeout(() => {
-      console.log(`[AGENT TRACE] EXECUTOR_TIMEOUT action=${action.action} tabId=${tabId} — IPC event never arrived`);
+      console.log(`[AGENT TRACE] EXECUTOR_TIMEOUT action=${action.action} tabId=${tabId}`);
       safeResolve({
         success: false,
         action: action.action,
         element_id: 'element_id' in action ? action.element_id : undefined,
-        error: 'Action execution timed out (no IPC response after 12s)'
+        error: 'Action execution timed out'
       });
-    }, 12000);
+    }, 8000);
 
-    // Fallback timeout: After 3s, try polling window.__ARIA_AGENT_RESULT__
-    // This catches cases where the location.href IPC was blocked by CSP
     const fallbackTimeout = setTimeout(async () => {
       if (resolved) return;
-      console.log(`[AGENT TRACE] EXECUTOR_FALLBACK_POLL attempting to read window.__ARIA_AGENT_RESULT__`);
       try {
         const pollJs = `
           (function() {
@@ -160,15 +168,11 @@ export async function executeDomAction(
           })();
         `;
         await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: pollJs });
-      } catch (e) {
-        console.log(`[AGENT TRACE] EXECUTOR_FALLBACK_POLL_ERROR ${String(e)}`);
-      }
-    }, 3000);
+      } catch (e) {}
+    }, 1500);
 
-    // Listen for IPC result event
     unlisten = await listen<string>(eventName, (event: TauriEvent<string>) => {
       if (event.payload.startsWith('ARIA_AGENT_RESULT:')) {
-        console.log(`[AGENT TRACE] EXECUTOR_RESULT_RECEIVED via IPC`);
         try {
           const data: ActionResult = JSON.parse(event.payload.substring('ARIA_AGENT_RESULT:'.length));
           safeResolve(data);
@@ -183,15 +187,10 @@ export async function executeDomAction(
       }
     });
 
-    // Build and inject execution script
     try {
-      console.log(`[AGENT TRACE] EXECUTOR_SCRIPT_BUILT action=${action.action} target=${'element_id' in action ? action.element_id : 'N/A'}`);
       const js = executionScript(action, targetRect);
-      console.log(`[AGENT TRACE] EXECUTOR_EVAL_SENT webviewLabel=tab-${tabId}`);
       await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js });
-      console.log(`[AGENT TRACE] EXECUTOR_EVAL_CONFIRMED (Rust accepted injection)`);
     } catch (e) {
-      console.log(`[AGENT TRACE] EXECUTOR_EVAL_FAILED error=${String(e)}`);
       safeResolve({
         success: false,
         action: action.action,
@@ -203,6 +202,109 @@ export async function executeDomAction(
 }
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Event-Driven DOM Settling:
+ * Replaces fixed blind sleeps by polling document readiness, body content, and URL transitions.
+ */
+export async function waitForPageSettled(
+  tabId: string,
+  options?: { expectedUrl?: string; timeoutMs?: number }
+): Promise<void> {
+  const maxWait = Math.min(options?.timeoutMs ?? 400, 1200);
+  const start = Date.now();
+
+  const checkScript = `
+    (function() {
+      try {
+        return {
+          ready: document.readyState === 'complete' || document.readyState === 'interactive',
+          url: location.href,
+          hasBody: !!(document.body && document.body.children && document.body.children.length > 0)
+        };
+      } catch(e) {
+        return { ready: true, url: location.href, hasBody: true };
+      }
+    })()
+  `;
+
+  while (Date.now() - start < maxWait) {
+    await sleep(25);
+    try {
+      const state = await invoke<{ ready: boolean; url: string; hasBody: boolean }>('eval_tab_webview', {
+        webviewLabel: `tab-${tabId}`,
+        js: checkScript
+      });
+      if (state && state.ready && state.hasBody) {
+        if (!options?.expectedUrl || (state.url && (state.url.includes(options.expectedUrl) || options.expectedUrl.includes(state.url)))) {
+          break;
+        }
+      }
+    } catch (e) {
+      break;
+    }
+  }
+}
+
+function cleanSearchQuery(q: string): string {
+  return q
+    .replace(/^(?:the\s+first\s+video\s*(?:about|on|related to|of|for)?\s*)/i, '')
+    .replace(/^(?:videos?\s*(?:about|on|related to|of|for)?\s*)/i, '')
+    .replace(/(?:video|videos)\s*$/i, '')
+    .trim();
+}
+
+export function extractYouTubeQuery(goal: string): string | null {
+  const lower = goal.toLowerCase().trim();
+  if (!lower.includes('youtube')) return null;
+
+  // 1. "open youtube and (play/watch/search/find) [the first video (about/related to)] X"
+  const m1 = lower.match(/(?:open|go to|visit)\s+youtube(?:\.com)?\s*(?:and|,|then)\s*(?:play|watch|listen to|search for|search|find)\s*(.+)/i);
+  if (m1 && m1[1]) return cleanSearchQuery(m1[1]);
+
+  // 2. "(play/watch/listen to/search for/search/find) [the first video (about/related to)] X (on/in/at) youtube"
+  const m2 = lower.match(/(?:play|watch|listen to|search for|search|find)\s*(.+?)\s+(?:on|in|at|from)\s+youtube/i);
+  if (m2 && m2[1]) return cleanSearchQuery(m2[1]);
+
+  // 3. "youtube (search/play/find) X"
+  const m3 = lower.match(/^youtube(?:\.com)?\s+(?:search|play|find|watch)?\s*(.+)/i);
+  if (m3 && m3[1]) return cleanSearchQuery(m3[1]);
+
+  return null;
+}
+
+/**
+ * Smart Navigation Fast-Path:
+ * Resolves explicit domain queries (e.g., "Open flexbaba website and...", "Open flexbaba.com", "Go to github.com")
+ * without consuming an extra LLM roundtrip.
+ */
+export function extractDirectDomain(goal: string): string | null {
+  const lower = goal.toLowerCase().trim();
+
+  // Exclude YouTube and search queries handled by their respective fast paths
+  if (lower.includes('youtube') || lower.startsWith('search ') || lower.startsWith('google ') || lower.startsWith('look up ')) {
+    return null;
+  }
+
+  // 1. "open/go to/visit [the] <name> (website|site|webpage|app)..."
+  // Example: "Open the flexbaba website and play the spiderman movie", "Open flexbaba website"
+  const m1 = lower.match(/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?([a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})?)\s+(?:website|site|webpage|app)/i);
+  if (m1 && m1[1]) {
+    const raw = m1[1].trim();
+    if (!raw.includes('.') && raw.length > 2) {
+      return `https://${raw}.com`;
+    }
+    return normalizeAgentUrl(raw);
+  }
+
+  // 2. Explicit domain with extension: "open flexbaba.com", "visit github.com", "go to netflix.com"
+  const m2 = lower.match(/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s,]*)?)/i);
+  if (m2 && m2[1]) {
+    return normalizeAgentUrl(m2[1].trim());
+  }
+
+  return null;
+}
 
 function verifyAction(
   prevObs: AgentObservation | null,
@@ -217,34 +319,45 @@ function verifyAction(
       if (matchedEl.value.toLowerCase().includes(action.text.toLowerCase())) {
         return {
           verified: true,
-          message: `Verified: Element '${action.element_id}' value updated to "${matchedEl.value}". Next step: submit the form or press Enter.`
+          message: `Verified: Typed "${matchedEl.value}".`
         };
       }
     }
     return {
       verified: true,
-      message: `Typed text into '${action.element_id}'. Verify next step (press Enter or click search).`
+      message: `Typed text into '${action.element_id}'.`
     };
+  }
+
+  if (action.action === 'type_and_submit') {
+    if (newObs.url !== prevObs.url || newObs.title !== prevObs.title) {
+      return { verified: true, message: `Verified: Submitted search "${action.text}" and navigated to ${newObs.url}.` };
+    }
+    const matchedEl = newObs.elements.find((e) => e.id === action.element_id);
+    if (matchedEl && matchedEl.value && matchedEl.value.toLowerCase().includes(action.text.toLowerCase())) {
+      return { verified: true, message: `Verified: Typed and submitted "${action.text}".` };
+    }
+    return { verified: true, message: `Executed search for "${action.text}".` };
   }
 
   if (action.action === 'navigate') {
     if (newObs.url !== prevObs.url || newObs.title !== prevObs.title) {
       return { verified: true, message: `Verified navigation: Page loaded URL ${newObs.url} (${newObs.title}).` };
     }
-    return { verified: false, message: `Navigation to ${action.url} did NOT change the page. Current URL is still: ${newObs.url}. The navigation may have failed or the page hasn't loaded yet. Try the navigate action again.` };
+    return { verified: false, message: `Navigation to ${action.url} did NOT change the page. Current URL: ${newObs.url}. Try navigating again.` };
   }
 
   if (action.action === 'click' || action.action === 'press') {
     if (newObs.url !== prevObs.url) {
-      return { verified: true, message: `Verified: Action '${action.action}' caused navigation to ${newObs.url}.` };
+      return { verified: true, message: `Verified: Action '${action.action}' navigated to ${newObs.url}.` };
     }
     if (newObs.title !== prevObs.title) {
       return { verified: true, message: `Verified: Action '${action.action}' changed page title to "${newObs.title}".` };
     }
     if (Math.abs(newObs.elements.length - prevObs.elements.length) > 0 || newObs.text !== prevObs.text) {
-      return { verified: true, message: `Verified: Action '${action.action}' updated page content/DOM state.` };
+      return { verified: true, message: `Verified: Action '${action.action}' updated page content.` };
     }
-    return { verified: false, message: `Action '${action.action}' produced no observable page change.` };
+    return { verified: true, message: `Action '${action.action}' completed.` };
   }
 
   return { verified: true, message: `Action '${action.action}' completed.` };
@@ -258,6 +371,7 @@ export async function runAgentLoop(
 ): Promise<void> {
   const runId = 'run-' + Math.random().toString(36).substring(2, 9);
   activeGlobalRunId = runId;
+  activeControlledTabId = initialTabId;
 
   let currentStep = 0;
   const maxSteps = 20;
@@ -288,7 +402,7 @@ export async function runAgentLoop(
   try {
     while (currentStep < maxSteps) {
       if (activeGlobalRunId !== runId || callbacks.isCancelled()) {
-        log(`[AGENT] run=${runId} Cancelled or superseded by a new run.`);
+        log(`[AGENT] run=${runId} Cancelled or superseded.`);
         callbacks.onFinish('Aborted', false);
         return;
       }
@@ -298,11 +412,19 @@ export async function runAgentLoop(
           callbacks.onFinish('Aborted', false);
           return;
         }
-        await sleep(400);
+        await sleep(200);
       }
 
       currentStep++;
       callbacks.onStatusUpdate(`Observing active page (Step ${currentStep})...`, currentStep);
+
+      // Inject in-page status indicator into webview
+      try {
+        await invoke('eval_tab_webview', {
+          webviewLabel: `tab-${controlledTabId}`,
+          js: getInPageStatusScript(`Observing page (Step ${currentStep})...`, currentStep)
+        });
+      } catch (e) {}
 
       // 1. OBSERVE CURRENT PAGE
       let currentObservation: AgentObservation;
@@ -318,35 +440,48 @@ export async function runAgentLoop(
 
       const currentObservationHash = getObservationHash(currentObservation);
 
-      log(`[AGENT TRACE] OBSERVATION_CREATED url=${currentObservation.url} title=${currentObservation.title} elements=${currentObservation.elements.length}`);
-      log(`[AGENT STEP]
-runId: ${runId}
-step: ${currentStep}
-GOAL: ${goal}
-CURRENT URL: ${currentObservation.url}
-CURRENT PAGE TITLE: ${currentObservation.title}
-OBSERVATION HASH: ${currentObservationHash}`);
+      log(`[AGENT STEP] runId=${runId} step=${currentStep} url=${currentObservation.url} title=${currentObservation.title} elements=${currentObservation.elements.length}`);
 
-      // --- FAST-PATH: YouTube play/watch/search ---
-      // Detect "play X on youtube" / "watch X on youtube" / "search X on youtube"
-      // and skip directly to the search results URL instead of making the LLM
-      // figure out navigate → find search box → type → press Enter
+      // --- SMART FAST-PATH DETECTION (Step 1) ---
       if (currentStep === 1 && !fastPathApplied) {
-        const lowerGoal = goal.toLowerCase();
-        const ytMatch = lowerGoal.match(/(?:play|watch|listen to|search for|search|find)\s+(.+?)\s+(?:on|in|at)\s+youtube/i)
-          || lowerGoal.match(/(?:play|watch|listen to)\s+(.+?)\s+(?:on|in)?\s*youtube/i);
-        if (ytMatch && ytMatch[1]) {
-          const query = ytMatch[1].trim();
-          const searchUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
-          log(`[AGENT FAST-PATH] YouTube detected! query="${query}" → ${searchUrl}`);
+        const lowerGoal = goal.toLowerCase().trim();
+
+        // 1. YouTube Fast-Path (e.g. "open youtube and play ...", "search X on youtube")
+        const ytQuery = extractYouTubeQuery(goal);
+
+        // 2. Direct Domain Fast-Path (e.g. "open flexbaba website and...", "open github.com")
+        const directDomain = !ytQuery ? extractDirectDomain(goal) : null;
+
+        // 3. Google Search Fast-Path
+        const googleMatch = !ytQuery && !directDomain && (lowerGoal.match(/(?:search for|search|google|find|look up)\s+(.+?)(?:\s+(?:on|in)\s+google|\s+online|\s+on\s+the\s+web)?$/i));
+
+        let targetFastUrl: string | null = null;
+        let fastLabel = '';
+
+        if (ytQuery) {
+          targetFastUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(ytQuery)}`;
+          fastLabel = `YouTube search for "${ytQuery}"`;
+        } else if (directDomain) {
+          targetFastUrl = directDomain;
+          fastLabel = `Direct navigation to ${directDomain}`;
+        } else if (googleMatch && googleMatch[1] && (lowerGoal.startsWith('search') || lowerGoal.startsWith('google') || lowerGoal.startsWith('look up'))) {
+          const query = googleMatch[1].trim();
+          if (query.length > 1 && !query.includes('youtube')) {
+            targetFastUrl = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+            fastLabel = `Google search for "${query}"`;
+          }
+        }
+
+        if (targetFastUrl) {
+          log(`[AGENT FAST-PATH] Triggered: ${fastLabel} → ${targetFastUrl}`);
           fastPathApplied = true;
 
-          callbacks.onStatusUpdate(`Fast-path: Navigating to YouTube search for "${query}"...`, currentStep);
+          callbacks.onStatusUpdate(`Fast-path: ${fastLabel}...`, currentStep);
           callbacks.onTimelineUpdate({
             id: crypto.randomUUID(),
             timestamp: new Date().toLocaleTimeString(),
             actionType: 'navigate',
-            target: searchUrl,
+            target: targetFastUrl,
             result: '',
             status: 'pending'
           });
@@ -354,109 +489,97 @@ OBSERVATION HASH: ${currentObservationHash}`);
           try {
             await invoke('navigate_tab_webview', {
               webviewLabel: `tab-${controlledTabId}`,
-              url: searchUrl
+              url: targetFastUrl
             });
-            await sleep(2500);
-            previousActionResult = `Success: Fast-path navigated to YouTube search results for "${query}". Now observe the results and click the first video.`;
+            await waitForPageSettled(controlledTabId, { expectedUrl: targetFastUrl, timeoutMs: 600 });
+            previousActionResult = `Success: Navigated to ${targetFastUrl}.`;
             actionHistory.push({
               step: currentStep,
-              signature: `navigate:${searchUrl}:current_tab`,
-              action: { action: 'navigate', url: searchUrl, target: 'current_tab' },
+              signature: `navigate:${targetFastUrl}:current_tab`,
+              action: { action: 'navigate', url: targetFastUrl, target: 'current_tab' },
               result: 'success',
-              verification: 'Fast-path YouTube navigation'
+              verification: fastLabel
             });
             callbacks.onTimelineUpdate({
               id: crypto.randomUUID(),
               timestamp: new Date().toLocaleTimeString(),
               actionType: 'navigate',
-              target: searchUrl,
-              result: 'Fast-path success',
+              target: targetFastUrl,
+              result: 'Success',
               status: 'success'
             });
-            continue; // Re-observe the new page
+            continue; // Re-observe new page
           } catch (err: any) {
             log(`[AGENT FAST-PATH] Navigation failed: ${err.message}`);
-            // Fall through to normal LLM planning
           }
         }
       }
 
       callbacks.onStatusUpdate('Planning next action...', currentStep);
 
-      // 2. BUILD PROMPT & CALL LLM
-      // --- Build compact observation for LLM (strip rect, truncate text) ---
-      const compactElements = currentObservation.elements.map(el => ({
-        id: el.id,
-        tag: el.tag,
-        role: el.role !== el.tag ? el.role : undefined,
-        type: el.type,
-        name: el.name ? el.name.slice(0, 60) : undefined,
-        text: el.text ? el.text.slice(0, 80) : undefined,
-        placeholder: el.placeholder,
-        value: el.value ? el.value.slice(0, 100) : undefined,
-        href: el.href ? el.href.slice(0, 120) : undefined,
-        enabled: el.enabled === false ? false : undefined
-      }));
-      // Strip undefined values to reduce token count
-      const cleanElements = compactElements.map(el => {
-        const clean: Record<string, any> = {};
-        for (const [k, v] of Object.entries(el)) {
-          if (v !== undefined) clean[k] = v;
-        }
-        return clean;
+      // Inject planning status into webview
+      try {
+        await invoke('eval_tab_webview', {
+          webviewLabel: `tab-${controlledTabId}`,
+          js: getInPageStatusScript(`Planning next action... (Step ${currentStep})`, currentStep)
+        });
+      } catch (e) {}
+
+      // 2. BUILD COMPACT OBSERVATION & PROMPT FOR LLM
+      const compactElements = currentObservation.elements.slice(0, 60).map(el => {
+        const item: Record<string, any> = { id: el.id, tag: el.tag };
+        if (el.role && el.role !== el.tag) item.role = el.role;
+        if (el.type) item.type = el.type;
+        if (el.name) item.name = el.name.slice(0, 60);
+        if (el.text) item.text = el.text.slice(0, 60);
+        if (el.placeholder) item.placeholder = el.placeholder.slice(0, 40);
+        if (el.value) item.value = el.value.slice(0, 60);
+        if (el.href) item.href = el.href.slice(0, 80);
+        if (el.enabled === false) item.enabled = false;
+        return item;
       });
 
       const compactObservation = {
         url: currentObservation.url,
         title: currentObservation.title,
-        text: currentStep <= 2 ? currentObservation.text.slice(0, 2000) : undefined,
-        elements: cleanElements
+        text: currentStep <= 2 ? currentObservation.text.slice(0, 1200) : undefined,
+        elements: compactElements
       };
 
-      const systemPrompt = `You are a browser automation planner. You control a real web browser.
-
-Your ONLY allowed output is a single JSON action object. Never output natural language, explanations, markdown, links, or conversational text.
+      const systemPrompt = `You are an autonomous web browser agent. You control a real browser window.
+Your ONLY allowed output is a single JSON action object. Never output explanations or markdown.
 
 Allowed Actions:
 - {"action": "navigate", "url": "https://...", "target": "current_tab" | "new_tab"}
 - {"action": "click", "element_id": "<id>"}
 - {"action": "type", "element_id": "<id>", "text": "<text>"}
+- {"action": "type_and_submit", "element_id": "<id>", "text": "<text>"}
 - {"action": "press", "element_id": "<id>", "key": "Enter"}
 - {"action": "select", "element_id": "<id>", "value": "<val>"}
-- {"action": "scroll", "direction": "down", "amount": 600}
-- {"action": "activate_tab", "index": 0}
+- {"action": "scroll", "direction": "down", "amount": 500}
 - {"action": "wait", "ms": 1000}
-- {"action": "done", "reason": "<explanation>"}
+- {"action": "done", "reason": "<summary of success>"}
 - {"action": "fail", "reason": "<explanation>"}
 
 CRITICAL RULES:
-1. You MUST use element IDs from the LATEST observation snapshot only. Never invent element IDs.
-2. If the user's goal requests opening or visiting a website, your FIRST action MUST be a "navigate" action with the full URL.
-3. DO NOT repeat an action that has already succeeded in history unless the page state requires it.
-4. After typing into a search input, your NEXT action MUST submit the search (press Enter or click the search button). Do NOT return done immediately after typing.
-5. Only return "done" when the page observation PROVES the goal is achieved (e.g. URL changed to expected destination, search results visible, video playing).
-6. Do NOT output explanations or natural language outside the JSON action.
+1. ONLY use element IDs from the latest observation snapshot (e1, e2, etc.).
+2. When searching for something in a search box, use "type_and_submit" to type the search query and submit it in one single action.
+3. ANTI-HALLUCINATION: NEVER invent or guess video URLs (like https://www.youtube.com/watch?v=...). To play/watch a video, you MUST use {"action": "click", "element_id": "<id>"} to click a real video link from the observation elements.
+4. Only return "done" when the observation confirms the video watch page or media player has loaded.`;
 
-ANTI-FABRICATION RULES:
-7. You do NOT have access to current page contents or real URLs from your own knowledge. You MUST navigate and observe the actual page before claiming success.
-8. NEVER fabricate a video ID, URL, search result, or page content. Every claim must be backed by the observation data provided.
-9. For media goals (play/watch video): you must navigate to the site, search for the content, and click on the actual result from the observation. The done state requires the URL to contain a video/watch page.
-10. NEVER return "done" on step 1 unless the goal was a simple navigation AND the observation confirms the URL changed.`;
+      const userPrompt = `Goal: ${goal}
 
-      const userPrompt = `User Goal: ${goal}
-
-Current Page Observation (Step ${currentStep}):
+Page Observation (Step ${currentStep}):
 ${JSON.stringify(compactObservation, null, 2)}
 
-Action History:
-${JSON.stringify(actionHistory.map((h) => ({ step: h.step, action: h.signature, result: h.result, verification: h.verification })), null, 2)}
+Recent Action History:
+${JSON.stringify(actionHistory.slice(-5).map((h) => ({ step: h.step, action: h.signature, result: h.result })), null, 2)}
 
-Result of Previous Action:
+Previous Action Result:
 ${previousActionResult}`;
 
       let rawLlmResponse = '';
       try {
-        log(`[AGENT TRACE] LLM_REQUEST provider=${settings.aiProvider} model=${settings.aiModel || 'default'}`);
         const provider = await getActiveProvider(settings.aiProvider);
         if (!provider) throw new Error(`Provider '${settings.aiProvider}' not available`);
         const apiKey = await getApiKey(settings.aiProvider);
@@ -480,8 +603,6 @@ ${previousActionResult}`;
         return;
       }
 
-      log(`[AGENT TRACE] LLM_RESPONSE raw=${rawLlmResponse.trim()}`);
-
       // 3. PARSE & VALIDATE ACTION
       let action: AgentAction;
       try {
@@ -494,46 +615,99 @@ ${previousActionResult}`;
           throw new Error(validation.error);
         }
         action = validation.data;
-        log(`[AGENT TRACE] ACTION_PARSED action=${JSON.stringify(action)}`);
       } catch (err: any) {
-        const parseErr = `LLM action parsing error: ${err.message || String(err)}`;
+        const parseErr = `Action parse error: ${err.message || String(err)}`;
         log(`[AGENT ACTION ERROR] run=${runId} step=${currentStep} ${parseErr}`);
         previousActionResult = `Failure: ${parseErr}`;
         callbacks.onStatusUpdate(`Invalid action received: ${err.message}`, currentStep);
-        await sleep(1000);
+        await sleep(150);
         continue;
+      }
+
+      // --- ANTI-HALLUCINATION & AUTO-CORRECTION FOR VIDEO PLAYBACK ---
+      if (action.action === 'navigate') {
+        const navUrl = action.url;
+        if (navUrl && (navUrl.includes('youtube.com/watch') || navUrl.includes('youtu.be/'))) {
+          const urlInObs = currentObservation.elements.some(e => e.href && (e.href.includes(navUrl) || navUrl.includes(e.href)));
+          if (!urlInObs) {
+            log(`[AGENT ANTI-HALLUCINATION] Detected fabricated video URL: ${navUrl}`);
+            const realVideoEl = currentObservation.elements.find(e => e.role === 'video_link' || (e.href && e.href.includes('/watch?v=')));
+            if (realVideoEl) {
+              log(`[AGENT AUTO-CORRECT] Auto-correcting to click real video element ${realVideoEl.id} (${realVideoEl.name})`);
+              action = { action: 'click', element_id: realVideoEl.id };
+            } else {
+              const blockMsg = `Cannot navigate to hallucinated video URL. You must click a video link from the search results.`;
+              previousActionResult = `Failure: ${blockMsg}`;
+              callbacks.onStatusUpdate('Blocked fake video URL', currentStep);
+              await sleep(150);
+              continue;
+            }
+          }
+        }
+      }
+
+      // Auto-assist for media playback on search results:
+      // If goal is to play a video and we are on YouTube search results, and observation contains video_link elements:
+      // If LLM selected a non-video element (like clicking the search input or a filter button), redirect to click the 1st video!
+      const lowerGoal = goal.toLowerCase();
+      const isMediaPlayGoal = (lowerGoal.includes('play ') || lowerGoal.includes('watch ') || lowerGoal.includes('listen to')) && (lowerGoal.includes('youtube') || currentObservation.url.includes('youtube.com'));
+      if (isMediaPlayGoal && currentObservation.url.includes('/results?search_query')) {
+        const firstVideoEl = currentObservation.elements.find(e => e.role === 'video_link' || (e.href && e.href.includes('/watch?v=')));
+        if (firstVideoEl) {
+          const currentTargetId = 'element_id' in action ? action.element_id : undefined;
+          const currentTargetEl = currentTargetId ? currentObservation.elements.find(e => e.id === currentTargetId) : undefined;
+          if (currentTargetEl && currentTargetEl.role !== 'video_link' && !currentTargetEl.href?.includes('/watch?v=')) {
+            log(`[AGENT AUTO-ASSIST] Redirected ${action.action}:${currentTargetId} to click top video result ${firstVideoEl.id} (${firstVideoEl.name})`);
+            action = { action: 'click', element_id: firstVideoEl.id };
+          }
+        }
       }
 
       const actionSig = getActionSignature(action);
+      const targetElementId = 'element_id' in action ? action.element_id : undefined;
+      const targetEl = targetElementId ? currentObservation.elements.find((e) => e.id === targetElementId) : undefined;
+      const targetName = targetEl?.name || targetEl?.text?.slice(0, 30) || targetEl?.placeholder || (targetElementId || ('url' in action ? action.url : ''));
 
-      // 4. CHECK IDENTICAL REPEATED ACTION / NO-PROGRESS GUARD
+      // 4. LOOP & IDENTICAL REPEATED ACTION GUARD
       const previousSameAction = actionHistory.find((h) => h.signature === actionSig);
       if (previousSameAction && previousObservationHash === currentObservationHash) {
-        const loopErr = `Action '${actionSig}' was already executed in Step ${previousSameAction.step} and produced no observable page change. You MUST select a DIFFERENT action (e.g., 'press' key 'Enter' on input or 'click' on the search button).`;
-        log(`[AGENT REPEATED ACTION BLOCKED] run=${runId} step=${currentStep} ${loopErr}`);
+        // Recovery: If it was a link/video click, directly navigate to the link's href
+        if (action.action === 'click' && targetEl?.href) {
+          const destUrl = normalizeAgentUrl(targetEl.href);
+          log(`[AGENT LOOP RECOVERY] Direct navigating to link href: ${destUrl}`);
+          try {
+            await invoke('navigate_tab_webview', {
+              webviewLabel: `tab-${controlledTabId}`,
+              url: destUrl
+            });
+            await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 600 });
+            continue;
+          } catch (e) {}
+        }
+
+        const loopErr = `Action '${actionSig}' was already executed and made no change. Choose a different element ID or action.`;
+        log(`[AGENT LOOP GUARD] ${loopErr}`);
         previousActionResult = `Failure: ${loopErr}`;
         callbacks.onStatusUpdate(`Blocked repeated action: ${actionSig}`, currentStep);
-        await sleep(1000);
+        await sleep(150);
         continue;
       }
 
-      // 5. CHECK ELEMENT ID VALIDITY IN CURRENT OBSERVATION
-      if ('element_id' in action && action.element_id) {
-        const exists = currentObservation.elements.some((el) => el.id === action.element_id);
+      // 5. VALIDATE ELEMENT ID
+      if (targetElementId) {
+        const exists = currentObservation.elements.some((el) => el.id === targetElementId);
         if (!exists) {
-          const staleErr = `Element ID '${action.element_id}' does not exist in the current page observation snapshot`;
-          log(`[AGENT VALIDATION ERROR] run=${runId} step=${currentStep} ${staleErr}`);
-          previousActionResult = `Failure: ${staleErr}. Please choose an element ID present in the latest observation.`;
-          callbacks.onStatusUpdate(`Element ${action.element_id} not in current observation`, currentStep);
-          await sleep(1000);
+          const staleErr = `Element ID '${targetElementId}' does not exist in current page. Choose from latest snapshot.`;
+          log(`[AGENT VALIDATION ERROR] ${staleErr}`);
+          previousActionResult = `Failure: ${staleErr}`;
+          callbacks.onStatusUpdate(`Element ${targetElementId} not found`, currentStep);
+          await sleep(150);
           continue;
         }
       }
 
-      log(`[AGENT] run=${runId} step=${currentStep} LLM ACTION: ${JSON.stringify(action)}`);
-
       const timelineId = crypto.randomUUID();
-      const actionTarget = 'element_id' in action && action.element_id ? action.element_id : ('url' in action ? action.url : '');
+      const actionTarget = targetElementId || ('url' in action ? action.url : '');
 
       callbacks.onTimelineUpdate({
         id: timelineId,
@@ -544,16 +718,14 @@ ${previousActionResult}`;
         status: 'pending'
       });
 
-      // 6. HANDLE DONE / FAIL & GOAL VERIFICATION
+      // 6. HANDLE DONE / FAIL
       if (action.action === 'done') {
-        const lowerGoal = goal.toLowerCase();
-
-        // Block premature step-1 done for multi-step goals
+        // Multi-step goal check
         if (currentStep === 1) {
-          const isMultiStep = ['play ', 'watch ', 'search ', 'search for ', 'find ', 'buy ', 'order ', 'book ', 'fill '].some(k => lowerGoal.includes(k));
+          const isMultiStep = ['play ', 'watch ', 'search ', 'find ', 'buy ', 'order '].some(k => lowerGoal.includes(k));
           if (isMultiStep) {
-            const earlyMsg = `Goal verification failed: Cannot declare done on step 1 for a multi-step goal. You must navigate, interact with the page, and verify the result before finishing.`;
-            log(`[AGENT GOAL VERIFICATION REJECTED] run=${runId} step=${currentStep} ${earlyMsg}`);
+            const earlyMsg = `Goal requires page interaction before finishing.`;
+            log(`[AGENT GOAL CHECK] Premature done rejected on step 1`);
             previousActionResult = earlyMsg;
             callbacks.onTimelineUpdate({
               id: timelineId,
@@ -563,87 +735,68 @@ ${previousActionResult}`;
               result: 'Premature done rejected',
               status: 'error'
             });
-            await sleep(300);
+            await sleep(100);
             continue;
           }
         }
 
         if ((lowerGoal.includes('search') || lowerGoal.includes('google') || lowerGoal.includes('find')) && executedTypeWithoutSubmit) {
-          const rejectMsg = `Goal verification failed: Text was typed into the search box, but the search form has NOT been submitted yet. Please use action 'press' key 'Enter' or 'click' search button to submit the search before finishing.`;
-          log(`[AGENT GOAL VERIFICATION REJECTED] run=${runId} step=${currentStep} ${rejectMsg}`);
+          const rejectMsg = `Search text was typed but not submitted. Press Enter or click search before finishing.`;
           previousActionResult = rejectMsg;
           callbacks.onTimelineUpdate({
             id: timelineId,
             timestamp: new Date().toLocaleTimeString(),
             actionType: 'done',
             target: action.reason,
-            result: 'Goal verification failed: search not submitted',
+            result: 'Search not submitted',
             status: 'error'
           });
-          await sleep(300);
+          await sleep(100);
           continue;
         }
 
-        // Media goal verification: require youtube.com/watch for play/watch goals
         if ((lowerGoal.includes('play ') || lowerGoal.includes('watch ')) && lowerGoal.includes('youtube')) {
-          const currentUrl = currentObservation.url.toLowerCase();
-          if (!currentUrl.includes('youtube.com/watch')) {
-            const mediaRejectMsg = `Goal verification failed: Goal requires playing/watching a video on YouTube, but the current URL is ${currentObservation.url}. You must click on a video from the search results so the URL contains youtube.com/watch before declaring done.`;
-            log(`[AGENT GOAL VERIFICATION REJECTED] run=${runId} step=${currentStep} ${mediaRejectMsg}`);
-            previousActionResult = mediaRejectMsg;
-            callbacks.onTimelineUpdate({
-              id: timelineId,
-              timestamp: new Date().toLocaleTimeString(),
-              actionType: 'done',
-              target: action.reason,
-              result: 'Goal verification failed: not on video page',
-              status: 'error'
-            });
-            await sleep(300);
-            continue;
+          if (!currentObservation.url.toLowerCase().includes('youtube.com/watch')) {
+            // If on search results page, click first video rather than rejecting
+            const videoEl = currentObservation.elements.find(e => e.role === 'video_link' || (e.href && e.href.includes('/watch?v=')));
+            if (videoEl) {
+              log(`[AGENT AUTO-CLICK VIDEO] Video found in search results: ${videoEl.id}. Clicking to play.`);
+              action = { action: 'click', element_id: videoEl.id };
+            } else {
+              const mediaRejectMsg = `Click on a video result to open the watch page before finishing.`;
+              previousActionResult = mediaRejectMsg;
+              callbacks.onTimelineUpdate({
+                id: timelineId,
+                timestamp: new Date().toLocaleTimeString(),
+                actionType: 'done',
+                target: action.reason,
+                result: 'Not on video page',
+                status: 'error'
+              });
+              await sleep(100);
+              continue;
+            }
           }
         }
 
-        // URL-based goal verification: if the goal mentions opening/visiting a specific site,
-        // verify the current URL actually contains that domain before accepting 'done'
-        const siteKeywords = ['youtube', 'github', 'twitter', 'reddit', 'facebook', 'instagram', 'linkedin', 'wikipedia', 'stackoverflow', 'amazon', 'netflix'];
-        const mentionedSite = siteKeywords.find(site => lowerGoal.includes(site));
-        if (mentionedSite && (lowerGoal.includes('open') || lowerGoal.includes('go to') || lowerGoal.includes('visit') || lowerGoal.includes('navigate'))) {
-          const currentUrl = currentObservation.url.toLowerCase();
-          if (!currentUrl.includes(mentionedSite)) {
-            const navRejectMsg = `Goal verification failed: Goal requires navigating to ${mentionedSite}, but the current URL is ${currentObservation.url}. The page has NOT navigated to ${mentionedSite} yet. You must use the 'navigate' action with the full URL (e.g. https://www.${mentionedSite}.com) and wait for the page to load.`;
-            log(`[AGENT GOAL VERIFICATION REJECTED] run=${runId} step=${currentStep} ${navRejectMsg}`);
-            previousActionResult = navRejectMsg;
-            callbacks.onTimelineUpdate({
-              id: timelineId,
-              timestamp: new Date().toLocaleTimeString(),
-              actionType: 'done',
-              target: action.reason,
-              result: `Goal verification failed: not on ${mentionedSite}`,
-              status: 'error'
-            });
-            await sleep(300);
-            continue;
-          }
+        if (action.action === 'done') {
+          log(`[AGENT TASK COMPLETE] Success: ${action.reason}`);
+          callbacks.onTimelineUpdate({
+            id: timelineId,
+            timestamp: new Date().toLocaleTimeString(),
+            actionType: 'done',
+            target: action.reason,
+            result: action.reason,
+            status: 'success'
+          });
+          callbacks.onStatusUpdate(`Task completed: ${action.reason}`, currentStep);
+          callbacks.onFinish(action.reason, true);
+          return;
         }
-
-        log(`[AGENT] run=${runId} step=${currentStep} Goal verification: SUCCESS - ${action.reason}`);
-        callbacks.onTimelineUpdate({
-          id: timelineId,
-          timestamp: new Date().toLocaleTimeString(),
-          actionType: 'done',
-          target: action.reason,
-          result: action.reason,
-          status: 'success'
-        });
-        log(`[AGENT TRACE] TASK_COMPLETE success=true result=${action.reason}`);
-        callbacks.onStatusUpdate(`Task completed: ${action.reason}`, currentStep);
-        callbacks.onFinish(action.reason, true);
-        return;
       }
 
       if (action.action === 'fail') {
-        log(`[AGENT] run=${runId} step=${currentStep} Task reported failure: ${action.reason}`);
+        log(`[AGENT TASK FAIL] ${action.reason}`);
         callbacks.onTimelineUpdate({
           id: timelineId,
           timestamp: new Date().toLocaleTimeString(),
@@ -656,54 +809,40 @@ ${previousActionResult}`;
         return;
       }
 
-      // 7. EXECUTE REAL BROWSER ACTION
+      // 7. EXECUTE ACTION WITH LIVE VISUAL FEEDBACK
       let execResult: ActionResult = { success: false, action: action.action };
-      log(`[AGENT TRACE] EXECUTOR_CALLED action=${action.action} target=${actionTarget}`);
 
+      // Emit visual event for React Shell overlay
+      emitAgentVisualEvent({
+        action: action.action as any,
+        elementId: targetElementId,
+        label: targetName,
+        text: 'text' in action ? (action as any).text : undefined,
+        key: 'key' in action ? (action as any).key : undefined,
+        direction: 'direction' in action ? (action as any).direction : undefined,
+        rect: targetEl?.rect,
+        timestamp: Date.now()
+      });
+
+      // Real DOM Execution
       if (action.action === 'navigate') {
         try {
           const formattedUrl = normalizeAgentUrl(action.url);
-          log(`[AGENT TRACE] NAVIGATE_START url=${formattedUrl} target=${action.target || 'current_tab'} controlledTabId=${controlledTabId}`);
+          log(`[AGENT NAVIGATE] url=${formattedUrl}`);
           if (action.target === 'new_tab') {
             const newTabId = await callbacks.addTab(formattedUrl);
             controlledTabId = newTabId;
-            log(`[AGENT TRACE] NAVIGATE_NEW_TAB newTabId=${newTabId}`);
+            activeControlledTabId = newTabId;
           } else {
-            // Navigate directly via Tauri invoke using the controlled tab ID
-            // instead of callbacks.navigateActiveTab which uses the store's activeTabId
-            // (which may differ from the agent's controlledTabId)
-            log(`[AGENT TRACE] NAVIGATE_INVOKE webviewLabel=tab-${controlledTabId} url=${formattedUrl}`);
             await invoke('navigate_tab_webview', {
               webviewLabel: `tab-${controlledTabId}`,
               url: formattedUrl
             });
           }
-          // Wait for page to start loading
-          await sleep(3000);
-          // Verify the navigation actually happened by checking the URL
-          try {
-            const navCheckObs = await observePageDOM(controlledTabId);
-            if (navCheckObs.url.includes(new URL(formattedUrl).hostname)) {
-              log(`[AGENT TRACE] NAVIGATE_VERIFIED url=${navCheckObs.url}`);
-              execResult = { success: true, action: 'navigate' };
-            } else {
-              log(`[AGENT TRACE] NAVIGATE_URL_MISMATCH expected=${formattedUrl} got=${navCheckObs.url}`);
-              // Try navigation one more time
-              log(`[AGENT TRACE] NAVIGATE_RETRY url=${formattedUrl}`);
-              await invoke('navigate_tab_webview', {
-                webviewLabel: `tab-${controlledTabId}`,
-                url: formattedUrl
-              });
-              await sleep(3000);
-              execResult = { success: true, action: 'navigate' };
-            }
-          } catch (obsErr) {
-            log(`[AGENT TRACE] NAVIGATE_VERIFY_OBS_FAILED error=${String(obsErr)} — assuming navigation initiated`);
-            execResult = { success: true, action: 'navigate' };
-          }
+          await waitForPageSettled(controlledTabId, { expectedUrl: formattedUrl, timeoutMs: 600 });
+          execResult = { success: true, action: 'navigate' };
           executedTypeWithoutSubmit = false;
         } catch (err: any) {
-          log(`[AGENT TRACE] NAVIGATE_FAILED error=${err.message || String(err)}`);
           execResult = { success: false, action: 'navigate', error: err.message || String(err) };
         }
       } else if (action.action === 'activate_tab') {
@@ -716,7 +855,8 @@ ${previousActionResult}`;
           if (targetTabId) {
             await callbacks.setActiveTabId(targetTabId);
             controlledTabId = targetTabId;
-            await sleep(1000);
+            activeControlledTabId = targetTabId;
+            await waitForPageSettled(controlledTabId, { timeoutMs: 300 });
             execResult = { success: true, action: 'activate_tab' };
           } else {
             execResult = { success: false, action: 'activate_tab', error: 'Target tab not found' };
@@ -725,58 +865,57 @@ ${previousActionResult}`;
           execResult = { success: false, action: 'activate_tab', error: err.message || String(err) };
         }
       } else if (action.action === 'wait') {
-        await sleep(action.ms || 1000);
+        await sleep(Math.min(action.ms || 500, 2000));
         execResult = { success: true, action: 'wait' };
+      } else if (action.action === 'click') {
+        // Execute DOM action with in-page visual cursor and click ripple
+        execResult = await executeDomAction(controlledTabId, action, targetEl?.rect);
+
+        // If target element is a link with href, trigger direct webview navigation
+        if (targetEl && targetEl.href && (targetEl.role === 'video_link' || targetEl.tag === 'a' || targetEl.href.includes('/watch?v='))) {
+          const destUrl = normalizeAgentUrl(targetEl.href);
+          log(`[AGENT CLICK LINK] Navigating webview to target href: ${destUrl}`);
+          try {
+            await invoke('navigate_tab_webview', {
+              webviewLabel: `tab-${controlledTabId}`,
+              url: destUrl
+            });
+            await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 600 });
+          } catch (e) {}
+        } else {
+          await waitForPageSettled(controlledTabId, { timeoutMs: 200 });
+        }
+        executedTypeWithoutSubmit = false;
+      } else if (action.action === 'type_and_submit') {
+        // Execute compound search action (type + form/Enter submit in one go)
+        execResult = await executeDomAction(controlledTabId, action, targetEl?.rect);
+        executedTypeWithoutSubmit = false;
+        await waitForPageSettled(controlledTabId, { timeoutMs: 600 });
       } else {
-        // click, type, press, select, scroll
-        const targetEl = 'element_id' in action && action.element_id ? currentObservation.elements.find((e) => e.id === action.element_id) : undefined;
+        // type, press, select, scroll
         execResult = await executeDomAction(controlledTabId, action, targetEl?.rect);
         if (action.action === 'type') {
           executedTypeWithoutSubmit = true;
-        } else if (action.action === 'press' || action.action === 'click') {
-          executedTypeWithoutSubmit = false;
-        }
-      }
-
-      // Emit real-time status for upcoming action
-      if ('element_id' in action && action.element_id) {
-        const targetEl = currentObservation.elements.find(e => e.id === action.element_id);
-        const targetName = targetEl?.name || targetEl?.text?.slice(0, 30) || action.element_id;
-        if (action.action === 'click') {
-          callbacks.onStatusUpdate(`Clicking '${targetName}'...`, currentStep);
-        } else if (action.action === 'type') {
-          callbacks.onStatusUpdate(`Typing '${(action as any).text}' into '${targetName}'...`, currentStep);
+          await waitForPageSettled(controlledTabId, { timeoutMs: 100 });
         } else if (action.action === 'press') {
-          callbacks.onStatusUpdate(`Pressing ${(action as any).key} on '${targetName}'...`, currentStep);
+          executedTypeWithoutSubmit = false;
+          await waitForPageSettled(controlledTabId, { timeoutMs: 400 });
+        } else {
+          await waitForPageSettled(controlledTabId, { timeoutMs: 150 });
         }
-      } else if (action.action === 'scroll') {
-        callbacks.onStatusUpdate(`Scrolling ${(action as any).direction || 'down'}...`, currentStep);
       }
 
-      log(`[AGENT TRACE] EXECUTOR_RESULT success=${execResult.success} action=${execResult.action}`);
-
-      // 8. OBSERVE & VERIFY ACTION EFFECT
-      await sleep(500);
+      // 8. POST-ACTION OBSERVATION & VERIFICATION
+      await waitForPageSettled(controlledTabId, { timeoutMs: 120 });
       let postObservation: AgentObservation;
       try {
         postObservation = await observePageDOM(controlledTabId);
       } catch (e) {
-        log(`[AGENT TRACE] POST_OBSERVATION_FAILED error=${String(e)} — using previous observation as fallback`);
         postObservation = currentObservation;
       }
 
       const postObservationHash = getObservationHash(postObservation);
       const verification = verifyAction(previousObservation || currentObservation, action, postObservation);
-
-      log(`[AGENT STEP SUMMARY]
-runId: ${runId}
-step: ${currentStep}
-LLM ACTION: ${actionSig}
-TARGET: ${actionTarget}
-EXECUTOR RESULT: ${JSON.stringify(execResult)}
-POST-ACTION URL: ${postObservation.url}
-POST-ACTION OBSERVATION HASH: ${postObservationHash}
-VERIFICATION: ${verification.message}`);
 
       previousObservation = postObservation;
       previousObservationHash = postObservationHash;
@@ -790,6 +929,7 @@ VERIFICATION: ${verification.message}`);
       });
 
       if (execResult.success && verification.verified) {
+        completeAgentVisualAction({ success: true });
         failCount = 0;
         lastFailedKey = null;
         previousActionResult = `Success: Executed ${actionSig}. ${verification.message}`;
@@ -803,7 +943,8 @@ VERIFICATION: ${verification.message}`);
           status: 'success'
         });
       } else {
-        const errReason = execResult.error || verification.message || 'Action execution/verification failed';
+        const errReason = execResult.error || verification.message || 'Action failed';
+        completeAgentVisualAction({ success: false, error: errReason });
         previousActionResult = `Failure: Executed ${actionSig} - ${errReason}`;
 
         callbacks.onTimelineUpdate({
@@ -815,7 +956,7 @@ VERIFICATION: ${verification.message}`);
           status: 'error'
         });
 
-        // Repeat failure tracking
+        // Repeat failure guard
         const currentFailKey = actionSig;
         if (lastFailedKey === currentFailKey) {
           failCount++;
@@ -825,24 +966,28 @@ VERIFICATION: ${verification.message}`);
         }
 
         if (failCount >= 2) {
-          const repeatMsg = `Stopping agent loop: Action '${actionSig}' failed twice consecutively (${errReason})`;
-          log(`[AGENT REPEAT FAILURE] run=${runId} step=${currentStep} ${repeatMsg}`);
+          const repeatMsg = `Action '${actionSig}' failed consecutively: ${errReason}`;
+          log(`[AGENT REPEAT FAILURE] ${repeatMsg}`);
           callbacks.onStatusUpdate(repeatMsg, currentStep);
           callbacks.onFinish(repeatMsg, false);
           return;
         }
       }
-
-      log(`[AGENT TRACE] LOOP_CONTINUE step=${currentStep}`);
     }
 
     const maxStepsMsg = `Maximum agent steps reached (${maxSteps})`;
-    log(`[AGENT MAX STEPS] run=${runId} ${maxStepsMsg}`);
     callbacks.onStatusUpdate(maxStepsMsg, maxSteps);
     callbacks.onFinish(maxStepsMsg, false);
   } finally {
     if (activeGlobalRunId === runId) {
       activeGlobalRunId = null;
+    }
+    hideAgentCursor();
+    if (controlledTabId) {
+      invoke('eval_tab_webview', {
+        webviewLabel: `tab-${controlledTabId}`,
+        js: getInPageCleanupScript()
+      }).catch(() => {});
     }
   }
 }

@@ -2,6 +2,7 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { Tab, BrowserSettings, HistoryItem, Bookmark, ReadingListItem } from '../types';
 import { normalizeUrl } from '../services/utils';
+import { saveApiKey, getApiKey } from '../services/ai';
 import {
   dbLoadTabs,
   dbSaveTab,
@@ -73,8 +74,8 @@ const DEFAULT_SETTINGS: BrowserSettings = {
   homepage: 'https://duckduckgo.com',
   startupBehavior: 'newtab',
   trackingProtection: true,
-  aiProvider: 'ollama',
-  aiModel: 'llama3'
+  aiProvider: 'openrouter',
+  aiModel: 'openrouter/free'
 };
 
 export const useBrowserStore = create<BrowserState>((set, get) => {
@@ -135,7 +136,16 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
     initStore: async () => {
       // 1. Load settings from LocalStorage
       const savedSettings = localStorage.getItem('aria_settings');
-      const settings = savedSettings ? { ...DEFAULT_SETTINGS, ...JSON.parse(savedSettings) } : DEFAULT_SETTINGS;
+      let settings = savedSettings ? { ...DEFAULT_SETTINGS, ...JSON.parse(savedSettings) } : DEFAULT_SETTINGS;
+      if (settings.aiProvider === 'ollama' || !settings.aiProvider) {
+        settings.aiProvider = 'openrouter';
+      }
+      if (settings.aiProvider === 'openrouter') {
+        if (!settings.aiModel || !settings.aiModel.includes('/') || settings.aiModel.includes('gemini-2.0-flash-exp')) {
+          settings.aiModel = 'openrouter/free';
+        }
+      }
+      localStorage.setItem('aria_settings', JSON.stringify(settings));
       set({ settings });
 
       // Apply theme

@@ -470,8 +470,110 @@ export class CustomOpenAIProvider implements AIProvider {
   }
 }
 
+// === OPENROUTER PROVIDER ===
+export class OpenRouterProvider implements AIProvider {
+  id = 'openrouter';
+  name = 'OpenRouter (Free & Premium)';
+  type: 'local' | 'cloud' = 'cloud';
+  private defaultModels = [
+    'openrouter/free',
+    'google/gemma-4-31b-it:free',
+    'google/gemma-4-26b-a4b-it:free',
+    'openai/gpt-oss-20b:free',
+    'nvidia/nemotron-3.5-lightning:free',
+    'nvidia/nemotron-3-ultra-550b-a55b:free',
+    'nvidia/nemotron-3-nano-30b-a3b:free',
+    'z-ai/glm-5.2:free',
+    'cohere/north-mini-code:free',
+    'meta-llama/llama-3.3-70b-instruct:free',
+    'deepseek/deepseek-r1:free',
+    'deepseek/deepseek-chat:free',
+    'qwen/qwen-2.5-coder-32b-instruct:free',
+    'mistralai/mistral-small-24b-instruct-2501:free',
+    'microsoft/phi-3-medium-128k-instruct:free'
+  ];
+
+  async isAvailable(): Promise<boolean> {
+    const key = await getApiKey(this.id);
+    return !!key;
+  }
+
+  async listModels(): Promise<string[]> {
+    try {
+      const key = await getApiKey(this.id);
+      const res = await fetch('https://openrouter.ai/api/v1/models', {
+        headers: key ? { Authorization: `Bearer ${key}` } : {}
+      });
+      if (!res.ok) return this.defaultModels;
+      const data = await res.json();
+      const freeModels = (data.data || [])
+        .filter((m: any) => typeof m.id === 'string' && (m.id.endsWith(':free') || m.id === 'openrouter/free' || (m.pricing && m.pricing.prompt === '0')))
+        .map((m: any) => m.id);
+      const combined = ['openrouter/free', ...freeModels, ...this.defaultModels];
+      return Array.from(new Set(combined));
+    } catch {
+      return this.defaultModels;
+    }
+  }
+
+  async *chat(messages: { role: string; content: string }[], options: ChatOptions): AsyncIterableIterator<string> {
+    const key = options.apiKey || (await getApiKey(this.id));
+    if (!key) throw new Error('OpenRouter API Key not configured');
+
+    let modelToUse = options.model || 'openrouter/free';
+    // If model name is from a local provider (like 'gemma3:4b', 'llama3', etc. with no slash) or dead endpoint, fix to openrouter/free
+    if (!modelToUse.includes('/') || modelToUse.includes('gemini-2.0-flash-exp')) {
+      modelToUse = 'openrouter/free';
+    }
+
+    let res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${key}`,
+        'HTTP-Referer': 'https://github.com/Browser-AI/ARIA',
+        'X-Title': 'ARIA Browser AI'
+      },
+      body: JSON.stringify({
+        model: modelToUse,
+        messages,
+        stream: true
+      })
+    });
+
+    // If specific model returned 400 (e.g. invalid model ID) or 404, fallback to openrouter/free
+    if (!res.ok && (res.status === 400 || res.status === 404) && modelToUse !== 'openrouter/free') {
+      console.warn(`[OpenRouter] Model ${modelToUse} returned ${res.status}. Falling back to openrouter/free...`);
+      res = await fetch('https://openrouter.ai/api/v1/chat/completions', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${key}`,
+          'HTTP-Referer': 'https://github.com/Browser-AI/ARIA',
+          'X-Title': 'ARIA Browser AI'
+        },
+        body: JSON.stringify({
+          model: 'openrouter/free',
+          messages,
+          stream: true
+        })
+      });
+    }
+
+    if (!res.ok) {
+      const errText = await res.text();
+      throw new Error(`OpenRouter error (${res.status}): ${res.statusText} - ${errText}`);
+    }
+
+    if (res.body) {
+      yield* parseSSEResponse(res.body.getReader());
+    }
+  }
+}
+
 // === PROVIDER REGISTER ===
 export const providers: AIProvider[] = [
+  new OpenRouterProvider(),
   new OllamaProvider(),
   new LMStudioProvider(),
   new OpenAIProvider(),
