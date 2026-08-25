@@ -31,12 +31,11 @@ export const TabBar: React.FC = () => {
   };
 
   return (
-    <div className="flex items-end bg-[#0f172a] border-b border-slate-800 px-3 select-none w-full overflow-hidden">
+    <div className="flex items-center h-full bg-[#0f172a] px-2 select-none w-full overflow-hidden">
       {/* Draggable TitleBar Handle for Frameless window */}
       <div 
-        className="flex items-center flex-1 overflow-x-auto overflow-y-hidden gap-1.5 py-1.5 scrollbar-none"
+        className="flex items-center flex-1 h-full overflow-x-auto overflow-y-hidden gap-1 scrollbar-none py-1"
         onDoubleClick={async () => {
-          // Double click titlebar to maximize window
           const win = getCurrentWindow();
           if (await win.isMaximized()) {
             await win.unmaximize();
@@ -55,17 +54,17 @@ export const TabBar: React.FC = () => {
               onDragOver={handleDragOver}
               onDrop={(e) => handleDrop(e, idx)}
               onClick={() => setActiveTabId(tab.id)}
-              className={`group relative flex items-center gap-2 px-3 py-1.5 rounded-t-lg cursor-pointer transition-all duration-200 border-t border-x ${
+              className={`group relative flex items-center h-7 gap-1.5 px-2.5 rounded-md cursor-pointer transition-all duration-150 border ${
                 isActive
-                  ? 'bg-[#1e293b] border-slate-700 text-white font-medium shadow-md'
-                  : 'bg-[#0b0f19] border-transparent text-slate-400 hover:text-slate-200 hover:bg-[#131b2e]'
-              } ${tab.pinned ? 'min-w-[44px] max-w-[44px] justify-center' : 'min-w-[120px] max-w-[180px] flex-1'}`}
+                  ? 'bg-[#1e293b] border-slate-600/70 text-white font-medium shadow-sm'
+                  : 'bg-[#0b0f19]/60 border-transparent text-slate-400 hover:text-slate-200 hover:bg-[#131b2e]'
+              } ${tab.pinned ? 'min-w-[34px] max-w-[34px] justify-center px-1' : 'min-w-[110px] max-w-[190px] flex-1'}`}
             >
               {/* Favicon or fallback */}
               {tab.favicon ? (
-                <img src={tab.favicon} className="w-3.5 h-3.5 rounded" alt="" />
+                <img src={tab.favicon} className="w-3.5 h-3.5 rounded shrink-0" alt="" />
               ) : (
-                <div className={`w-3.5 h-3.5 rounded flex items-center justify-center text-[9px] font-bold ${
+                <div className={`w-3.5 h-3.5 rounded flex items-center justify-center text-[9px] font-bold shrink-0 ${
                   isActive ? 'bg-[#3b82f6] text-white' : 'bg-slate-700 text-slate-300'
                 }`}>
                   {tab.title[0]?.toUpperCase() || 'A'}
@@ -74,39 +73,43 @@ export const TabBar: React.FC = () => {
 
               {/* Title (hidden if pinned) */}
               {!tab.pinned && (
-                <span className="text-xs truncate flex-1 leading-none">
+                <span className="text-xs truncate flex-1 leading-none select-none">
                   {tab.title}
                 </span>
               )}
 
               {/* Loading Indicator */}
               {tab.loading && !tab.pinned && (
-                <div className="w-2.5 h-2.5 border-2 border-[#3b82f6] border-t-transparent rounded-full animate-spin"></div>
+                <div className="w-2.5 h-2.5 border-2 border-[#3b82f6] border-t-transparent rounded-full animate-spin shrink-0"></div>
               )}
 
-              {/* Close Button */}
-              {!tab.pinned && (
+              {/* Tab Actions: Pin & Close (Non-overlapping) */}
+              <div className="flex items-center gap-0.5 shrink-0">
+                {/* Pin Button */}
                 <button
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    closeTab(tab.id);
-                  }}
-                  className="p-0.5 rounded text-slate-500 hover:text-slate-200 hover:bg-slate-700 leading-none transition-all"
+                  onClick={(e) => handlePinToggle(e, tab.id, tab.pinned)}
+                  className={`p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-700/60 leading-none transition-opacity ${
+                    tab.pinned ? 'opacity-100 text-[#3b82f6]' : 'opacity-0 group-hover:opacity-100'
+                  }`}
+                  title={tab.pinned ? 'Unpin Tab' : 'Pin Tab'}
                 >
-                  <X size={11} />
+                  <Pin size={10} className={tab.pinned ? 'fill-[#3b82f6]' : ''} />
                 </button>
-              )}
 
-              {/* Pin Icon (Only visible on hover/pin state) */}
-              <button
-                onClick={(e) => handlePinToggle(e, tab.id, tab.pinned)}
-                className={`absolute right-1 top-1/2 -translate-y-1/2 p-0.5 rounded text-slate-500 hover:text-slate-200 hover:bg-slate-700 leading-none opacity-0 group-hover:opacity-100 transition-opacity duration-150 ${
-                  tab.pinned ? 'opacity-100 right-[unset] top-[unset] translate-y-0 relative' : ''
-                }`}
-                title={tab.pinned ? 'Unpin Tab' : 'Pin Tab'}
-              >
-                {tab.pinned ? <Pin size={10} className="text-[#3b82f6] fill-[#3b82f6]" /> : <Pin size={10} />}
-              </button>
+                {/* Close Button */}
+                {!tab.pinned && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      closeTab(tab.id);
+                    }}
+                    className="p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-700 leading-none transition-opacity opacity-0 group-hover:opacity-100"
+                    title="Close Tab"
+                  >
+                    <X size={11} />
+                  </button>
+                )}
+              </div>
             </div>
           );
         })}
@@ -115,10 +118,10 @@ export const TabBar: React.FC = () => {
       {/* New Tab Button */}
       <button
         onClick={() => addTab()}
-        className="p-1.5 mb-1.5 ml-2 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white transition-all cursor-pointer border border-slate-700"
+        className="p-1 mx-1.5 rounded-md bg-slate-800/80 hover:bg-slate-700 text-slate-300 hover:text-white transition-all cursor-pointer border border-slate-700/80 shrink-0"
         title="Open New Tab (Cmd+T)"
       >
-        <Plus size={14} />
+        <Plus size={13} />
       </button>
     </div>
   );

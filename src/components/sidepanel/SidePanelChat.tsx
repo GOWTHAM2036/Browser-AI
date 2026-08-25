@@ -14,7 +14,8 @@ import {
   ChevronUp, 
   Terminal, 
   Bot,
-  Zap
+  Zap,
+  GraduationCap
 } from 'lucide-react';
 import { Message } from '../../types';
 import { marked } from 'marked';
@@ -111,6 +112,14 @@ export const SidePanelChat: React.FC<SidePanelChatProps> = ({
               >
                 <Sparkles size={14} className="text-purple-400 group-hover:scale-110 transition-transform" />
                 <span>Agent Task</span>
+              </button>
+
+              <button
+                onClick={() => handleQuickChip('Auto solve quiz / assessment')}
+                className="col-span-2 flex items-center justify-center gap-2 p-2.5 bg-gradient-to-r from-purple-950/80 to-indigo-950/80 hover:from-purple-900/90 hover:to-indigo-900/90 border border-purple-800/60 rounded-xl text-[11px] font-semibold text-purple-200 shadow-md transition-all text-center group cursor-pointer"
+              >
+                <GraduationCap size={15} className="text-pink-400 group-hover:scale-110 transition-transform" />
+                <span>Auto Solve Quiz / Test</span>
               </button>
             </div>
           </div>

@@ -2,11 +2,12 @@ import React, { useState, useEffect, useRef } from 'react';
 import { useBrowserStore } from '../store/browserStore';
 import { listen, Event as TauriEvent } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { Sparkles, Bug, X } from 'lucide-react';
+import { Sparkles, Bug, X, Settings as SettingsIcon } from 'lucide-react';
 import { getActiveProvider, getApiKey } from '../services/ai';
 import { dbGetChatHistory, dbAddChatMessage, dbClearChatHistory } from '../services/db';
 import { Message, AgentStepItem, AgentMessageData } from '../types';
 import { runAgentLoop, cancelActiveAgentRun } from '../services/agent/agentLoop';
+import { runAutoQuizSolver, cancelActiveQuizRun } from '../services/agent/quizSolver';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
 
@@ -15,12 +16,29 @@ import { SidePanelChat } from './sidepanel/SidePanelChat';
 import { AgentDebug } from './sidepanel/AgentDebug';
 
 export function detectUserIntent(query: string): { 
-  type: 'agent' | 'intel' | 'chat'; 
+  type: 'agent' | 'intel' | 'chat' | 'quiz'; 
   goal?: string; 
   intelMode?: 'summarize' | 'translate' | 'facts'; 
   targetLang?: string; 
 } {
   const lower = query.trim().toLowerCase();
+
+  // 0. Dedicated Quiz & Assessment Auto-Solver Intent
+  if (
+    lower.includes('solve quiz') ||
+    lower.includes('auto solve') ||
+    lower.includes('solve test') ||
+    lower.includes('solve assessment') ||
+    lower.includes('answer all questions') ||
+    lower.includes('answer questions') ||
+    lower.includes('solve questions') ||
+    lower.includes('solve mcq') ||
+    lower.includes('solve mcqs') ||
+    lower.includes('/quiz') ||
+    lower.includes('/solve')
+  ) {
+    return { type: 'quiz', goal: query.trim() };
+  }
 
   // 1. Page Intelligence Intent
   if (
@@ -49,14 +67,21 @@ export function detectUserIntent(query: string): {
     return { type: 'intel', intelMode: 'translate', targetLang };
   }
 
-  // 2. Browser Action / Automation Intent
+  // 2. Direct URL or Domain presence is an agent navigation/task
+  if (/https?:\/\/|[a-zA-Z0-9.-]+\.(?:com|org|net|in|io|ai|app|edu|gov|co|dev|me|site|xyz)/i.test(query)) {
+    return { type: 'agent', goal: query.trim() };
+  }
+
+  // 3. Browser Action / Task / Automation Intent
   const actionKeywords = [
-    'click', 'type', 'search for', 'search ', 'navigate', 'go to', 'fill out',
-    'fill ', 'press', 'scroll', 'open ', 'buy ', 'order ', 'book ', 'login',
-    'sign in', 'submit', 'find on page', 'select',
-    'play ', 'watch ', 'listen ', 'stream ', 'download ',
-    'visit ', 'close tab', 'refresh', 'reload', 'enter ',
-    'check ', 'uncheck', 'toggle'
+    'click', 'type', 'search', 'navigate', 'go to', 'fill out', 'fill',
+    'press', 'scroll', 'open', 'buy', 'order', 'book', 'login', 'log in',
+    'sign in', 'signin', 'signup', 'sign up', 'register', 'submit', 'find on page',
+    'find', 'select', 'choose', 'pick', 'answer', 'solve', 'complete',
+    'take', 'do', 'mcq', 'mcqs', 'quiz', 'test', 'exam', 'question', 'questions',
+    'form', 'survey', 'play', 'watch', 'listen', 'stream', 'download',
+    'visit', 'close tab', 'refresh', 'reload', 'enter', 'check', 'uncheck',
+    'toggle', 'help me', 'can you', 'please', 'browse', 'start'
   ];
 
   const isAction = actionKeywords.some(keyword => lower.includes(keyword));
@@ -64,7 +89,7 @@ export function detectUserIntent(query: string): {
     return { type: 'agent', goal: query.trim() };
   }
 
-  // 3. Q&A / Conversation Intent
+  // 4. Q&A / General Conversation
   return { type: 'chat' };
 }
 
@@ -271,6 +296,91 @@ export const SidePanel: React.FC = () => {
     }
   };
 
+  // Dedicated Quiz & Assessment Solver Runner
+  const runQuizSolverForMessage = async (msgId: string, _goal?: string) => {
+    if (!activeTabId) return;
+
+    cancelActiveQuizRun();
+    cancelActiveAgentRun();
+    setIsAgentRunning(true);
+    agentCancelRef.current[msgId] = false;
+    agentPausedRef.current[msgId] = false;
+
+    let timeline: AgentStepItem[] = [];
+    let logs: string[] = [];
+
+    const updateMessageState = (updates: Partial<AgentMessageData>) => {
+      setMessages(prev => prev.map(m => {
+        if (m.id !== msgId || !m.agentData) return m;
+        return {
+          ...m,
+          agentData: {
+            ...m.agentData,
+            ...updates
+          }
+        };
+      }));
+    };
+
+    try {
+      await runAutoQuizSolver(
+        activeTabId,
+        settings,
+        {
+          onStatusUpdate: (status, currentStep) => {
+            updateMessageState({ status, currentStep, running: true });
+          },
+          onTimelineUpdate: (item) => {
+            const existingIdx = timeline.findIndex(it => it.id === item.id);
+            if (existingIdx >= 0) {
+              timeline[existingIdx] = item;
+            } else {
+              timeline = [...timeline, item];
+            }
+            updateMessageState({ timeline: [...timeline] });
+          },
+          onLog: (logStr) => {
+            logs = [...logs, logStr];
+            updateMessageState({ logs: [...logs] });
+          },
+          onFinish: async (result, success) => {
+            updateMessageState({
+              running: false,
+              status: success ? 'Completed' : 'Finished',
+              result: result
+            });
+            setIsAgentRunning(false);
+
+            setMessages(currentMessages => {
+              const finalMsg = currentMessages.find(m => m.id === msgId);
+              if (finalMsg && finalMsg.agentData) {
+                const serializedContent = '__AGENT_DATA__:' + JSON.stringify(finalMsg.agentData);
+                dbAddChatMessage({
+                  tab_id: activeTabId,
+                  role: 'assistant',
+                  content: serializedContent,
+                  provider: settings.aiProvider,
+                  model: settings.aiModel || ''
+                });
+              }
+              return currentMessages;
+            });
+          },
+          isCancelled: () => !!agentCancelRef.current[msgId],
+          isPaused: () => !!agentPausedRef.current[msgId]
+        }
+      );
+    } catch (err: any) {
+      console.error('[QUIZ TRACE] ERROR in runQuizSolverForMessage:', err);
+      updateMessageState({
+        running: false,
+        status: `Error: ${err.message || String(err)}`
+      });
+    } finally {
+      setIsAgentRunning(false);
+    }
+  };
+
   const pauseAgent = (msgId: string) => {
     agentPausedRef.current[msgId] = true;
     setMessages(prev => prev.map(m => m.id === msgId && m.agentData ? {
@@ -289,6 +399,7 @@ export const SidePanel: React.FC = () => {
 
   const stopAgent = (msgId: string) => {
     cancelActiveAgentRun();
+    cancelActiveQuizRun();
     agentCancelRef.current[msgId] = true;
     setIsAgentRunning(false);
     setMessages(prev => prev.map(m => m.id === msgId && m.agentData ? {
@@ -313,6 +424,7 @@ export const SidePanel: React.FC = () => {
     if (isGenerating || isAgentRunning) {
       console.log('[AGENT TRACE] Cancelling previous agent run to execute new request');
       cancelActiveAgentRun();
+      cancelActiveQuizRun();
       setIsAgentRunning(false);
       setIsGenerating(false);
     }
@@ -327,11 +439,40 @@ export const SidePanel: React.FC = () => {
     });
     setMessages(prev => [...prev, userMsg]);
 
-    // Parse Intent: Agent action vs Intelligence vs Chat Q&A
+    // Parse Intent: Agent action vs Intelligence vs Chat Q&A vs Quiz
     const intent = detectUserIntent(text);
     console.log('[AGENT TRACE] SUBMIT_HANDLER', { type: intent.type, goal: intent.goal || text });
 
-    if (intent.type === 'agent') {
+    if (intent.type === 'quiz') {
+      // 0. Dedicated Quiz & Assessment Solver Task
+      const assistantMsgId = crypto.randomUUID();
+      console.log('[QUIZ TRACE] QUIZ_TASK_CREATED', { msgId: assistantMsgId, goal: intent.goal || text });
+
+      const initialAgentData: AgentMessageData = {
+        goal: 'Auto Solve Assessment / Quiz',
+        status: 'Starting Quiz Auto-Solver...',
+        running: true,
+        paused: false,
+        currentStep: 0,
+        timeline: [],
+        logs: []
+      };
+
+      const agentMsg: Message = {
+        id: assistantMsgId,
+        tab_id: activeTabId,
+        role: 'assistant',
+        content: text,
+        provider: settings.aiProvider,
+        model: settings.aiModel || '',
+        created_at: Date.now(),
+        messageType: 'agent',
+        agentData: initialAgentData
+      };
+
+      setMessages(prev => [...prev, agentMsg]);
+      runQuizSolverForMessage(assistantMsgId, intent.goal || text);
+    } else if (intent.type === 'agent') {
       // 1. Web Automation Agent Task
       const assistantMsgId = crypto.randomUUID();
       console.log('[AGENT TRACE] TASK_CREATED', { msgId: assistantMsgId, goal: intent.goal || text });
@@ -439,7 +580,7 @@ export const SidePanel: React.FC = () => {
         const pageText = await extractPageContent();
 
         const stream = provider.chat([
-          { role: 'system', content: `You are Aria Browser AI Assistant. Current Page Context:\n${pageText.slice(0, 3000)}` },
+          { role: 'system', content: `You are Aria Browser AI Assistant, an integrated AI assistant inside an AI-powered web browser. You assist the user with web browsing, research, page analysis, and answering questions directly and helpfully.\n\nCurrent Page Context:\n${pageText.slice(0, 3000)}` },
           ...messages.filter(m => m.messageType !== 'agent').map(m => ({ role: m.role, content: m.content })),
           { role: 'user', content: text }
         ], { model: settings.aiModel || '', apiKey: key || undefined });
@@ -497,6 +638,15 @@ export const SidePanel: React.FC = () => {
         </div>
 
         <div className="flex items-center gap-1">
+          {/* Settings Button */}
+          <button
+            onClick={() => window.dispatchEvent(new CustomEvent('aria-open-settings'))}
+            className="p-1.5 rounded-lg text-slate-400 hover:bg-slate-800 hover:text-white transition-all cursor-pointer"
+            title="Settings"
+          >
+            <SettingsIcon size={14} />
+          </button>
+
           {/* Debug Toggle Icon */}
           <button
             onClick={() => setShowDebugDrawer(!showDebugDrawer)}

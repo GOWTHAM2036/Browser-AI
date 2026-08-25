@@ -56,15 +56,40 @@ export function buildExecutionScript(
       document.head.appendChild(styleEl);
     }
 
+    // --- Shared Safe Chunked IPC Transport ---
+    var sendIpc = function(payload) {
+      try {
+        var rawStr = String(payload);
+        var CHUNK_SIZE = 1000;
+        var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
+        var msgId = 'msg_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+
+        if (total === 1 && rawStr.length < 1500) {
+          location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
+          return;
+        }
+
+        for (var i = 0; i < total; i++) {
+          (function(idx) {
+            setTimeout(function() {
+              var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+              var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
+                             '&index=' + idx +
+                             '&total=' + total +
+                             '&data=' + encodeURIComponent(slice);
+              location.href = chunkUrl;
+            }, idx * 25);
+          })(i);
+        }
+      } catch(e) {}
+    };
+
     // --- IPC result reporter ---
     var result = function(data) {
       try { window.__ARIA_AGENT_RESULT__ = data; } catch(e) {}
       var payloadStr = JSON.stringify(data);
       console.log('[ARIA_EXEC] RESULT_READY payload=' + payloadStr);
-      setTimeout(function() {
-        console.log('[ARIA_EXEC] IPC_SEND via location.href');
-        location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent('ARIA_AGENT_RESULT:' + payloadStr);
-      }, 10);
+      sendIpc('ARIA_AGENT_RESULT:' + payloadStr);
     };
 
     // 1. Resolve Target Element
@@ -299,6 +324,31 @@ export function buildExecutionScript(
             try { el.click(); } catch(e) {}
           }
 
+          // Ensure radio/checkbox state is updated and dispatches change/input events
+          var inputTarget = el;
+          if (el.tagName === 'LABEL') {
+            if (el.htmlFor) {
+              try {
+                var boundInput = document.getElementById(el.htmlFor);
+                if (boundInput) inputTarget = boundInput;
+              } catch(e) {}
+            } else {
+              var nestedInput = el.querySelector('input');
+              if (nestedInput) inputTarget = nestedInput;
+            }
+          }
+          if (inputTarget && inputTarget.tagName === 'INPUT') {
+            var iType = inputTarget.type ? inputTarget.type.toLowerCase() : '';
+            if (iType === 'radio') {
+              inputTarget.checked = true;
+              try { inputTarget.dispatchEvent(new Event('input', { bubbles: true })); } catch(e) {}
+              try { inputTarget.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
+            } else if (iType === 'checkbox') {
+              try { inputTarget.dispatchEvent(new Event('input', { bubbles: true })); } catch(e) {}
+              try { inputTarget.dispatchEvent(new Event('change', { bubbles: true })); } catch(e) {}
+            }
+          }
+
           // If it is a link with href, trigger navigation fallback
           var href = el.href || el.getAttribute('href');
           if (href && !href.startsWith('javascript:') && !href.startsWith('#')) {
@@ -415,9 +465,7 @@ export function buildExecutionScript(
       error: errorMsg
     });
     try { window.__ARIA_AGENT_RESULT__ = JSON.parse(payloadStr); } catch(e) {}
-    setTimeout(function() {
-      location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent('ARIA_AGENT_RESULT:' + payloadStr);
-    }, 10);
+    sendIpc('ARIA_AGENT_RESULT:' + payloadStr);
   }
 })();
   `;

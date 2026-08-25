@@ -99,12 +99,34 @@ export const ReaderMode: React.FC = () => {
     });
 
     try {
-      // Inject script to extract document outerHTML
+      // Inject script to extract document outerHTML safely via chunked transport
       const js = `
-        try {
-          const html = document.documentElement.outerHTML || '';
-          window.location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(html);
-        } catch(e) {}
+        (function() {
+          try {
+            var rawStr = document.documentElement.outerHTML || '';
+            var CHUNK_SIZE = 600;
+            var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
+            var msgId = 'msg_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+
+            if (total === 1 && rawStr.length < 1500) {
+              location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
+              return;
+            }
+
+            for (var i = 0; i < total; i++) {
+              (function(idx) {
+                setTimeout(function() {
+                  var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+                  var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
+                                 '&index=' + idx +
+                                 '&total=' + total +
+                                 '&data=' + encodeURIComponent(slice);
+                  location.href = chunkUrl;
+                }, idx * 25);
+              })(i);
+            }
+          } catch(e) {}
+        })();
       `;
       await invoke('eval_tab_webview', { webviewLabel: `tab-${activeTabId}`, js: js });
     } catch (e: any) {

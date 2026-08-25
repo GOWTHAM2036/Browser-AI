@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useBrowserStore } from '../store/browserStore';
-import { Search, Sparkles, History, Bookmark, ArrowRight } from 'lucide-react';
+import { Search, Sparkles, History, Bookmark, ArrowRight, X } from 'lucide-react';
 import { normalizeUrl } from '../services/utils';
 
 export const Omnibox: React.FC = () => {
@@ -132,17 +132,17 @@ export const Omnibox: React.FC = () => {
   };
 
   return (
-    <div ref={containerRef} className="relative flex-1 max-w-2xl mx-4 select-none">
+    <div ref={containerRef} className="relative flex-1 min-w-[200px] max-w-2xl mx-2 select-none">
       <div className={`relative flex items-center bg-[#0b0f19] border rounded-lg transition-all duration-200 ${
         askAiActive 
-          ? 'border-purple-600 ring-2 ring-purple-600/20' 
-          : 'border-slate-700 focus-within:border-[#3b82f6] focus-within:ring-2 focus-within:ring-[#3b82f6]/20'
+          ? 'border-purple-500 ring-2 ring-purple-500/20' 
+          : 'border-slate-700/80 focus-within:border-[#3b82f6] focus-within:ring-2 focus-within:ring-[#3b82f6]/20'
       }`}>
-        <div className="pl-3 text-slate-400">
+        <div className="pl-2.5 text-slate-400 shrink-0">
           {askAiActive ? (
-            <Sparkles size={14} className="text-purple-400 animate-pulse" />
+            <Sparkles size={13} className="text-purple-400 animate-pulse" />
           ) : (
-            <Search size={14} />
+            <Search size={13} />
           )}
         </div>
 
@@ -152,17 +152,27 @@ export const Omnibox: React.FC = () => {
           onChange={handleInputChange}
           onKeyDown={handleKeyDown}
           onFocus={() => setShowSuggestions(true)}
-          placeholder={askAiActive ? "Ask AI about anything... (Enter to ask)" : "Search or type URL... (Cmd+Enter to Ask AI)"}
-          className="w-full bg-transparent border-0 py-1.5 pl-2.5 pr-12 text-xs text-slate-200 outline-none placeholder-slate-500 font-sans"
+          placeholder={askAiActive ? "Ask AI anything... (Enter to submit)" : "Search or type URL... (Ctrl+Enter to Ask AI)"}
+          className="w-full bg-transparent border-0 py-1 pl-2 pr-14 text-xs text-slate-100 outline-none placeholder-slate-500 font-sans"
         />
 
-        <div className="absolute right-3 flex items-center gap-1.5 text-[10px] text-slate-500">
+        {inputValue && (
+          <button
+            onClick={() => setInputValue('')}
+            className="p-1 mr-1 text-slate-500 hover:text-slate-300 rounded cursor-pointer transition-colors"
+            title="Clear"
+          >
+            <X size={11} />
+          </button>
+        )}
+
+        <div className="pr-2 flex items-center shrink-0 text-[10px] text-slate-500">
           {askAiActive ? (
-            <span className="bg-purple-950 text-purple-300 border border-purple-800 px-1.5 py-0.5 rounded-md flex items-center gap-1">
+            <span className="bg-purple-950 text-purple-300 border border-purple-800 px-1.5 py-0.5 rounded-md flex items-center gap-1 font-medium">
               AI mode
             </span>
           ) : (
-            <span className="border border-slate-700 bg-slate-900 px-1 py-0.5 rounded-md leading-none text-slate-400">
+            <span className="border border-slate-800 bg-slate-900/90 px-1 py-0.5 rounded text-[9px] text-slate-400 font-mono">
               Ctrl+Enter
             </span>
           )}
@@ -171,7 +181,7 @@ export const Omnibox: React.FC = () => {
 
       {/* Autocomplete suggestions dropdown */}
       {showSuggestions && suggestions.length > 0 && (
-        <div className="absolute left-0 right-0 mt-1.5 bg-[#0b0f19] border border-slate-800 rounded-lg shadow-xl overflow-hidden z-[9999] max-h-64 overflow-y-auto">
+        <div className="absolute left-0 right-0 mt-1 bg-[#0b0f19] border border-slate-800 rounded-lg shadow-2xl overflow-hidden z-[9999] max-h-64 overflow-y-auto">
           {suggestions.map((s, idx) => {
             const isSelected = idx === suggestionIdx;
             return (
@@ -179,20 +189,20 @@ export const Omnibox: React.FC = () => {
                 key={idx}
                 onClick={() => handleSelectSuggestion(s.url)}
                 onMouseEnter={() => setSuggestionIdx(idx)}
-                className={`flex items-center gap-3 px-3 py-2 text-xs cursor-pointer border-l-2 transition-all ${
+                className={`flex items-center gap-2.5 px-3 py-2 text-xs cursor-pointer border-l-2 transition-all ${
                   isSelected 
-                    ? 'bg-[#1e293b] border-slate-400 text-white' 
-                    : 'border-transparent text-slate-400 hover:bg-[#131b2e] hover:text-slate-300'
+                    ? 'bg-[#1e293b] border-blue-400 text-white' 
+                    : 'border-transparent text-slate-400 hover:bg-[#131b2e] hover:text-slate-200'
                 }`}
               >
-                <div className="text-slate-500">
+                <div className="text-slate-500 shrink-0">
                   {s.type === 'bookmark' ? <Bookmark size={12} className="text-yellow-500" /> : <History size={12} />}
                 </div>
                 <div className="flex-1 min-w-0">
-                  <div className="font-medium truncate text-slate-200">{s.title}</div>
+                  <div className="font-medium truncate text-slate-200 text-xs">{s.title}</div>
                   <div className="text-[10px] text-slate-500 truncate">{s.url}</div>
                 </div>
-                <ArrowRight size={12} className={`opacity-0 ${isSelected ? 'opacity-100' : ''}`} />
+                <ArrowRight size={12} className={`shrink-0 opacity-0 ${isSelected ? 'opacity-100 text-blue-400' : ''}`} />
               </div>
             );
           })}

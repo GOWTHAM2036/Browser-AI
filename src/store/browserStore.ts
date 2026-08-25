@@ -2,7 +2,6 @@ import { create } from 'zustand';
 import { invoke } from '@tauri-apps/api/core';
 import { Tab, BrowserSettings, HistoryItem, Bookmark, ReadingListItem } from '../types';
 import { normalizeUrl } from '../services/utils';
-import { saveApiKey, getApiKey } from '../services/ai';
 import {
   dbLoadTabs,
   dbSaveTab,
@@ -127,7 +126,7 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
     settings: DEFAULT_SETTINGS,
     sidebarOpen: false,
     sidebarMode: 'chat',
-    sidebarWidth: 350,
+    sidebarWidth: 360,
     readerModeActive: false,
     askAiActive: false,
     windowWidth: window.innerWidth,
@@ -252,8 +251,8 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
         try {
           await invoke('resize_tab_webview', {
             webviewLabel: `tab-${currentActiveId}`,
-            x: -3000,
-            y: -3000,
+            x: -10000,
+            y: -10000,
             width: 100,
             height: 100
           });

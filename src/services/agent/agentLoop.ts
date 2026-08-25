@@ -91,18 +91,22 @@ export async function observePageDOM(tabId: string): Promise<AgentObservation> {
   return new Promise(async (resolve, reject) => {
     const eventName = `page-content-tab-${tabId}`;
     let unlisten: (() => void) | null = null;
+    console.log(`[OBSERVE-START] tabId=${tabId} event=${eventName}`);
 
     const timeout = setTimeout(() => {
       if (unlisten) unlisten();
-      reject(new Error('Page observation timed out after 6 seconds'));
-    }, 6000);
+      console.log(`[OBSERVE-TIMEOUT] tabId=${tabId}`);
+      reject(new Error('Page observation timed out after 10 seconds'));
+    }, 10000);
 
     unlisten = await listen<string>(eventName, (event: TauriEvent<string>) => {
+      console.log(`[OBSERVE-EVENT-RECEIVED] event=${eventName} payloadLen=${event.payload.length}`);
       if (event.payload.startsWith('ARIA_AGENT_OBSERVATION:')) {
         clearTimeout(timeout);
         if (unlisten) unlisten();
         try {
           const data = JSON.parse(event.payload.substring('ARIA_AGENT_OBSERVATION:'.length));
+          console.log(`[OBSERVE-RESOLVED] tabId=${tabId} elementCount=${data.elements ? data.elements.length : 0}`);
           resolve(data);
         } catch (e) {
           reject(e);
@@ -162,7 +166,28 @@ export async function executeDomAction(
               var r = window.__ARIA_AGENT_RESULT__;
               if (r) {
                 delete window.__ARIA_AGENT_RESULT__;
-                location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent('ARIA_AGENT_RESULT:' + JSON.stringify(r));
+                var rawStr = 'ARIA_AGENT_RESULT:' + JSON.stringify(r);
+                var CHUNK_SIZE = 600;
+                var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
+                var msgId = 'msg_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+
+                if (total === 1 && rawStr.length < 1500) {
+                  location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
+                  return;
+                }
+
+                for (var i = 0; i < total; i++) {
+                  (function(idx) {
+                    setTimeout(function() {
+                      var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+                      var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
+                                     '&index=' + idx +
+                                     '&total=' + total +
+                                     '&data=' + encodeURIComponent(slice);
+                      location.href = chunkUrl;
+                    }, idx * 25);
+                  })(i);
+                }
               }
             } catch(e) {}
           })();
@@ -204,46 +229,15 @@ export async function executeDomAction(
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 /**
- * Event-Driven DOM Settling:
- * Replaces fixed blind sleeps by polling document readiness, body content, and URL transitions.
+ * DOM Settling helper:
+ * Allows reasonable time for the browser and network stack to process navigation, layout, and rendering.
  */
 export async function waitForPageSettled(
-  tabId: string,
+  _tabId: string,
   options?: { expectedUrl?: string; timeoutMs?: number }
 ): Promise<void> {
-  const maxWait = Math.min(options?.timeoutMs ?? 400, 1200);
-  const start = Date.now();
-
-  const checkScript = `
-    (function() {
-      try {
-        return {
-          ready: document.readyState === 'complete' || document.readyState === 'interactive',
-          url: location.href,
-          hasBody: !!(document.body && document.body.children && document.body.children.length > 0)
-        };
-      } catch(e) {
-        return { ready: true, url: location.href, hasBody: true };
-      }
-    })()
-  `;
-
-  while (Date.now() - start < maxWait) {
-    await sleep(25);
-    try {
-      const state = await invoke<{ ready: boolean; url: string; hasBody: boolean }>('eval_tab_webview', {
-        webviewLabel: `tab-${tabId}`,
-        js: checkScript
-      });
-      if (state && state.ready && state.hasBody) {
-        if (!options?.expectedUrl || (state.url && (state.url.includes(options.expectedUrl) || options.expectedUrl.includes(state.url)))) {
-          break;
-        }
-      }
-    } catch (e) {
-      break;
-    }
-  }
+  const waitTime = Math.min(options?.timeoutMs ?? 1000, 4000);
+  await sleep(waitTime);
 }
 
 function cleanSearchQuery(q: string): string {
@@ -276,19 +270,35 @@ export function extractYouTubeQuery(goal: string): string | null {
 /**
  * Smart Navigation Fast-Path:
  * Resolves explicit domain queries (e.g., "Open flexbaba website and...", "Open flexbaba.com", "Go to github.com")
- * without consuming an extra LLM roundtrip.
+ * or full URLs without consuming an extra LLM roundtrip.
  */
 export function extractDirectDomain(goal: string): string | null {
   const lower = goal.toLowerCase().trim();
 
-  // Exclude YouTube and search queries handled by their respective fast paths
-  if (lower.includes('youtube') || lower.startsWith('search ') || lower.startsWith('google ') || lower.startsWith('look up ')) {
+  // If extractYouTubeQuery matched a specific video/search query, let extractYouTubeQuery handle it
+  if (extractYouTubeQuery(goal)) {
     return null;
+  }
+
+  // Direct full URL provided in goal: e.g. "https://learning.ccbp.in/...", "open https://learning.ccbp.in/"
+  const urlMatch = goal.match(/https?:\/\/[^\s,]+/i);
+  if (urlMatch) {
+    return urlMatch[0];
+  }
+
+  // Exclude search queries handled by search fast path
+  if (lower.startsWith('search ') || lower.startsWith('google ') || lower.startsWith('look up ')) {
+    return null;
+  }
+
+  // Direct YouTube homepage: "open youtube", "open youtube.com", "go to youtube", "visit youtube"
+  if (/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?youtube(?:\.com)?(?:\s+(?:website|site|webpage|app))?$/i.test(lower)) {
+    return 'https://www.youtube.com';
   }
 
   // 1. "open/go to/visit [the] <name> (website|site|webpage|app)..."
   // Example: "Open the flexbaba website and play the spiderman movie", "Open flexbaba website"
-  const m1 = lower.match(/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?([a-zA-Z0-9-]+(?:\.[a-zA-Z]{2,})?)\s+(?:website|site|webpage|app)/i);
+  const m1 = lower.match(/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?([a-zA-Z0-9.-]+(?:\.[a-zA-Z]{2,})?)\s*(?:website|site|webpage|app|platform)/i);
   if (m1 && m1[1]) {
     const raw = m1[1].trim();
     if (!raw.includes('.') && raw.length > 2) {
@@ -297,13 +307,29 @@ export function extractDirectDomain(goal: string): string | null {
     return normalizeAgentUrl(raw);
   }
 
-  // 2. Explicit domain with extension: "open flexbaba.com", "visit github.com", "go to netflix.com"
-  const m2 = lower.match(/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?([a-zA-Z0-9-]+\.[a-zA-Z]{2,}(?:\/[^\s,]*)?)/i);
+  // 2. Explicit domain with extension (including subdomains): "open learning.ccbp.in", "visit github.com", "go to netflix.com"
+  const m2 = lower.match(/^(?:open|go to|visit|navigate to)\s+(?:the\s+)?([a-zA-Z0-9.-]+\.[a-zA-Z]{2,}(?:\/[^\s,]*)?)/i);
   if (m2 && m2[1]) {
     return normalizeAgentUrl(m2[1].trim());
   }
 
   return null;
+}
+
+/** Detects if the user goal is to answer questions, complete an assessment, or solve a quiz */
+export function isQuizOrAssessmentGoal(goal: string): boolean {
+  const lower = goal.toLowerCase();
+  return (
+    lower.includes('answer all') ||
+    lower.includes('answer the question') ||
+    lower.includes('solve all the question') ||
+    lower.includes('solve quiz') ||
+    lower.includes('solve assessment') ||
+    lower.includes('solve mcq') ||
+    lower.includes('complete the practice') ||
+    lower.includes('daily practice') ||
+    lower.includes('quiz solver')
+  );
 }
 
 function verifyAction(
@@ -374,7 +400,7 @@ export async function runAgentLoop(
   activeControlledTabId = initialTabId;
 
   let currentStep = 0;
-  const maxSteps = 20;
+  const maxSteps = 100;
   let controlledTabId = initialTabId;
   let previousObservation: AgentObservation | null = null;
   let previousObservationHash: string | null = null;
@@ -491,7 +517,7 @@ export async function runAgentLoop(
               webviewLabel: `tab-${controlledTabId}`,
               url: targetFastUrl
             });
-            await waitForPageSettled(controlledTabId, { expectedUrl: targetFastUrl, timeoutMs: 600 });
+            await waitForPageSettled(controlledTabId, { expectedUrl: targetFastUrl, timeoutMs: 1200 });
             previousActionResult = `Success: Navigated to ${targetFastUrl}.`;
             actionHistory.push({
               step: currentStep,
@@ -526,15 +552,16 @@ export async function runAgentLoop(
       } catch (e) {}
 
       // 2. BUILD COMPACT OBSERVATION & PROMPT FOR LLM
-      const compactElements = currentObservation.elements.slice(0, 60).map(el => {
+      const compactElements = currentObservation.elements.slice(0, 150).map(el => {
         const item: Record<string, any> = { id: el.id, tag: el.tag };
         if (el.role && el.role !== el.tag) item.role = el.role;
         if (el.type) item.type = el.type;
-        if (el.name) item.name = el.name.slice(0, 60);
-        if (el.text) item.text = el.text.slice(0, 60);
+        if (el.name) item.name = el.name.slice(0, 80);
+        if (el.text && el.text !== el.name) item.text = el.text.slice(0, 80);
         if (el.placeholder) item.placeholder = el.placeholder.slice(0, 40);
         if (el.value) item.value = el.value.slice(0, 60);
         if (el.href) item.href = el.href.slice(0, 80);
+        if (el.checked !== undefined) item.checked = el.checked;
         if (el.enabled === false) item.enabled = false;
         return item;
       });
@@ -542,30 +569,37 @@ export async function runAgentLoop(
       const compactObservation = {
         url: currentObservation.url,
         title: currentObservation.title,
-        text: currentStep <= 2 ? currentObservation.text.slice(0, 1200) : undefined,
+        text: currentObservation.text.slice(0, 3500),
         elements: compactElements
       };
 
-      const systemPrompt = `You are an autonomous web browser agent. You control a real browser window.
-Your ONLY allowed output is a single JSON action object. Never output explanations or markdown.
+      const systemPrompt = `You are ARIA, an expert autonomous browser AI agent. You control a real browser window to achieve the user's goal step-by-step.
+Your ONLY allowed output is a single JSON action object. Never output markdown, explanations, or commentary.
 
 Allowed Actions:
-- {"action": "navigate", "url": "https://...", "target": "current_tab" | "new_tab"}
 - {"action": "click", "element_id": "<id>"}
 - {"action": "type", "element_id": "<id>", "text": "<text>"}
 - {"action": "type_and_submit", "element_id": "<id>", "text": "<text>"}
-- {"action": "press", "element_id": "<id>", "key": "Enter"}
 - {"action": "select", "element_id": "<id>", "value": "<val>"}
-- {"action": "scroll", "direction": "down", "amount": 500}
+- {"action": "scroll", "direction": "down" | "up", "amount": 600}
+- {"action": "press", "element_id": "<id>", "key": "Enter" | "Tab" | "Escape"}
+- {"action": "navigate", "url": "https://...", "target": "current_tab" | "new_tab"}
 - {"action": "wait", "ms": 1000}
-- {"action": "done", "reason": "<summary of success>"}
-- {"action": "fail", "reason": "<explanation>"}
+- {"action": "done", "reason": "<explanation of how the goal was achieved>"}
+- {"action": "fail", "reason": "<explanation of failure>"}
 
 CRITICAL RULES:
-1. ONLY use element IDs from the latest observation snapshot (e1, e2, etc.).
-2. When searching for something in a search box, use "type_and_submit" to type the search query and submit it in one single action.
-3. ANTI-HALLUCINATION: NEVER invent or guess video URLs (like https://www.youtube.com/watch?v=...). To play/watch a video, you MUST use {"action": "click", "element_id": "<id>"} to click a real video link from the observation elements.
-4. Only return "done" when the observation confirms the video watch page or media player has loaded.`;
+1. AUTONOMOUS TASK EXECUTION: Execute all required actions autonomously until the user's goal is fully achieved.
+2. MULTI-QUESTION / QUIZ / MCQ / FORM TASKS:
+   - Carefully read each question from the page text and observation elements.
+   - Select the best/correct answer for each question by clicking the matching radio button, checkbox, or option element_id.
+   - If questions or options extend below the fold, answer the visible ones and scroll down ({"action": "scroll", "direction": "down", "amount": 600}) to view and answer the rest.
+   - For multi-page quizzes/forms with Next / Submit buttons, click "Next" or "Submit" after filling in all questions on the page.
+   - Do NOT stop or call "done" until ALL questions/tasks are finished and submitted.
+3. ELEMENT IDs: ONLY use element IDs from the latest observation snapshot (e1, e2, etc.).
+4. SEARCH: When searching, use "type_and_submit" to enter the search term and submit in one action.
+5. MEDIA / VIDEOS: To play/watch a video, click the actual video link element from the observation. Do not fabricate URLs.
+6. COMPLETION: Only return "done" when the entire goal has been completed.`;
 
       const userPrompt = `Goal: ${goal}
 
@@ -669,8 +703,8 @@ ${previousActionResult}`;
       const targetName = targetEl?.name || targetEl?.text?.slice(0, 30) || targetEl?.placeholder || (targetElementId || ('url' in action ? action.url : ''));
 
       // 4. LOOP & IDENTICAL REPEATED ACTION GUARD
-      const previousSameAction = actionHistory.find((h) => h.signature === actionSig);
-      if (previousSameAction && previousObservationHash === currentObservationHash) {
+      const lastExecutedAction = actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null;
+      if (lastExecutedAction && lastExecutedAction.signature === actionSig && previousObservationHash === currentObservationHash) {
         // Recovery: If it was a link/video click, directly navigate to the link's href
         if (action.action === 'click' && targetEl?.href) {
           const destUrl = normalizeAgentUrl(targetEl.href);
@@ -680,12 +714,12 @@ ${previousActionResult}`;
               webviewLabel: `tab-${controlledTabId}`,
               url: destUrl
             });
-            await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 600 });
+            await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 1200 });
             continue;
           } catch (e) {}
         }
 
-        const loopErr = `Action '${actionSig}' was already executed and made no change. Choose a different element ID or action.`;
+        const loopErr = `Action '${actionSig}' was just executed on this identical page state and made no change. Choose a different element ID or action.`;
         log(`[AGENT LOOP GUARD] ${loopErr}`);
         previousActionResult = `Failure: ${loopErr}`;
         callbacks.onStatusUpdate(`Blocked repeated action: ${actionSig}`, currentStep);
@@ -839,7 +873,7 @@ ${previousActionResult}`;
               url: formattedUrl
             });
           }
-          await waitForPageSettled(controlledTabId, { expectedUrl: formattedUrl, timeoutMs: 600 });
+          await waitForPageSettled(controlledTabId, { expectedUrl: formattedUrl, timeoutMs: 1200 });
           execResult = { success: true, action: 'navigate' };
           executedTypeWithoutSubmit = false;
         } catch (err: any) {
@@ -856,7 +890,7 @@ ${previousActionResult}`;
             await callbacks.setActiveTabId(targetTabId);
             controlledTabId = targetTabId;
             activeControlledTabId = targetTabId;
-            await waitForPageSettled(controlledTabId, { timeoutMs: 300 });
+            await waitForPageSettled(controlledTabId, { timeoutMs: 400 });
             execResult = { success: true, action: 'activate_tab' };
           } else {
             execResult = { success: false, action: 'activate_tab', error: 'Target tab not found' };
@@ -880,17 +914,17 @@ ${previousActionResult}`;
               webviewLabel: `tab-${controlledTabId}`,
               url: destUrl
             });
-            await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 600 });
+            await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 1200 });
           } catch (e) {}
         } else {
-          await waitForPageSettled(controlledTabId, { timeoutMs: 200 });
+          await waitForPageSettled(controlledTabId, { timeoutMs: 300 });
         }
         executedTypeWithoutSubmit = false;
       } else if (action.action === 'type_and_submit') {
         // Execute compound search action (type + form/Enter submit in one go)
         execResult = await executeDomAction(controlledTabId, action, targetEl?.rect);
         executedTypeWithoutSubmit = false;
-        await waitForPageSettled(controlledTabId, { timeoutMs: 600 });
+        await waitForPageSettled(controlledTabId, { timeoutMs: 1000 });
       } else {
         // type, press, select, scroll
         execResult = await executeDomAction(controlledTabId, action, targetEl?.rect);

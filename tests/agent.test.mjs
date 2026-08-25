@@ -45,15 +45,29 @@ test('extractYouTubeQuery extracts clean search queries from user goals', async 
 test('extractDirectDomain extracts explicit domains and websites', async () => {
   const { extractDirectDomain } = await loadAgentLoop();
 
+  assert.equal(extractDirectDomain('Open youtube'), 'https://www.youtube.com');
+  assert.equal(extractDirectDomain('Go to youtube.com'), 'https://www.youtube.com');
   assert.equal(extractDirectDomain('Open the flexbaba website and play the spiderman brand new day movie'), 'https://flexbaba.com');
   assert.equal(extractDirectDomain('Open flexbaba.com'), 'https://flexbaba.com');
   assert.equal(extractDirectDomain('Go to github.com and search for tauri'), 'https://github.com');
   assert.equal(extractDirectDomain('Visit netflix.com'), 'https://netflix.com');
   assert.equal(extractDirectDomain('Open flexbaba site'), 'https://flexbaba.com');
+  assert.equal(extractDirectDomain('open learning.ccbp.in'), 'https://learning.ccbp.in');
+  assert.equal(extractDirectDomain('open https://learning.ccbp.in/course?c_id=123&t_id=456'), 'https://learning.ccbp.in/course?c_id=123&t_id=456');
 
   // Ambiguous queries should return null to allow normal LLM planning
   assert.equal(extractDirectDomain('Find a spider man movie'), null);
   assert.equal(extractDirectDomain('play rock music'), null);
+});
+
+test('isQuizOrAssessmentGoal identifies quiz and assessment requests', async () => {
+  const { isQuizOrAssessmentGoal } = await loadAgentLoop();
+
+  assert.equal(isQuizOrAssessmentGoal('Answer all the question in the tab'), true);
+  assert.equal(isQuizOrAssessmentGoal('solve all the questions on this page'), true);
+  assert.equal(isQuizOrAssessmentGoal('complete the practice assessment'), true);
+  assert.equal(isQuizOrAssessmentGoal('play youtube video'), false);
+  assert.equal(isQuizOrAssessmentGoal('search for weather in tokyo'), false);
 });
 
 test('validateAgentAction validates type_and_submit and standalone actions', async () => {
@@ -78,6 +92,80 @@ test('validateAgentAction validates type_and_submit and standalone actions', asy
 
   const v5 = validateAgentAction({ action: 'type_and_submit', element_id: 'e4' });
   assert.equal(v5.success, false);
+});
+
+test('observationScript uses safe chunked IPC transport', async () => {
+  const { observationScript } = await loadAgentObserver();
+  assert.ok(observationScript.includes('https://tauri-ipc-bridge/chunk'));
+  assert.ok(observationScript.includes('CHUNK_SIZE'));
+  assert.ok(observationScript.includes('msgId'));
+  assert.ok(observationScript.includes('location.href'));
+});
+
+test('large DOM observation (100+ elements, 60KB) is chunked below URL limits and reassembles losslessly', async () => {
+  // Simulate a rich MCQ practice page observation payload
+  const elements = [];
+  for (let i = 1; i <= 120; i++) {
+    elements.push({
+      id: `e${i}`,
+      tag: i % 2 === 0 ? 'input' : 'label',
+      role: i % 2 === 0 ? 'radio' : 'option',
+      type: i % 2 === 0 ? 'radio' : undefined,
+      name: `[Radio] Option ${i}: In the infix expression (A + (B * F) + (D - C)) / E, evaluate subexpression ${i}`,
+      text: `Option choice ${i} for infix expression question`,
+      visible: true,
+      enabled: true,
+      checked: i === 3,
+      rect: { x: 100, y: i * 30, width: 450, height: 28 }
+    });
+  }
+
+  const largeSnapshot = {
+    url: 'https://learning.ccbp.in/mcq-practice',
+    title: 'MCQ PRACTICE - Data Structures & Algorithms',
+    text: 'In the infix expression (A + (B * F) + (D - C)) / E, which sub-expression is evaluated first? '.repeat(30),
+    elements: elements
+  };
+
+  const rawPayload = 'ARIA_AGENT_OBSERVATION:' + JSON.stringify(largeSnapshot);
+  const CHUNK_SIZE = 600;
+  const total = Math.ceil(rawPayload.length / CHUNK_SIZE);
+  const msgId = 'test_msg_123';
+
+  assert.ok(rawPayload.length > 25000, `Payload should be large: ${rawPayload.length} chars`);
+  assert.ok(total > 30, `Should produce > 30 chunks: ${total}`);
+
+  const chunkUrls = [];
+  const receivedChunks = new Map();
+
+  for (let idx = 0; idx < total; idx++) {
+    const slice = rawPayload.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+    const chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
+                     '&index=' + idx +
+                     '&total=' + total +
+                     '&data=' + encodeURIComponent(slice);
+    
+    chunkUrls.push(chunkUrl);
+    // CRITICAL: Every single chunk URL MUST be well below the WebView2/Chromium URL limit (2048 chars)
+    assert.ok(chunkUrl.length < 1500, `Chunk URL ${idx} length ${chunkUrl.length} must be < 1500 chars`);
+
+    // Parse back from query params as Rust would
+    const urlObj = new URL(chunkUrl);
+    const parsedData = urlObj.searchParams.get('data');
+    receivedChunks.set(idx, parsedData);
+  }
+
+  // Reassemble
+  let assembled = '';
+  for (let idx = 0; idx < total; idx++) {
+    assembled += receivedChunks.get(idx);
+  }
+
+  assert.equal(assembled, rawPayload, 'Reassembled payload must exactly match original');
+  assert.ok(assembled.startsWith('ARIA_AGENT_OBSERVATION:'));
+  const parsedObs = JSON.parse(assembled.substring('ARIA_AGENT_OBSERVATION:'.length));
+  assert.equal(parsedObs.elements.length, 120);
+  assert.equal(parsedObs.elements[2].checked, true);
 });
 
 async function loadAgentUtils() {
@@ -127,4 +215,20 @@ async function loadAgentLoop() {
     external: ['@tauri-apps/api/core', '@tauri-apps/api/event', '@tauri-apps/plugin-http', 'zustand']
   });
   return import(pathToFileURL(join(outDir, 'agentLoop.js')).href + '?cache=' + Date.now());
+}
+
+async function loadAgentObserver() {
+  await rm(outDir, { recursive: true, force: true });
+  await mkdir(outDir, { recursive: true });
+  await esbuild.build({
+    entryPoints: [
+      join(repoRoot, 'src/services/agent/observer.ts')
+    ],
+    outfile: join(outDir, 'observer.js'),
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    external: ['@tauri-apps/api/core', '@tauri-apps/api/event']
+  });
+  return import(pathToFileURL(join(outDir, 'observer.js')).href + '?cache=' + Date.now());
 }

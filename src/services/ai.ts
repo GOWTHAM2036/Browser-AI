@@ -19,21 +19,26 @@ export interface AIProvider {
 
 // === SECURE KEYCHAIN HELPERS ===
 export async function saveApiKey(providerId: string, apiKey: string): Promise<void> {
-  await invoke('save_credential', { service: 'aria-ai-keys', username: providerId, secret: apiKey });
+  try {
+    await invoke('save_credential', { service: 'aria-ai-keys', username: providerId, secret: apiKey });
+  } catch {
+    localStorage.setItem(`aria_key_${providerId}`, apiKey);
+  }
 }
 
 export async function getApiKey(providerId: string): Promise<string | null> {
   try {
-    return await invoke<string>('get_credential', { service: 'aria-ai-keys', username: providerId });
-  } catch {
-    return null;
-  }
+    const key = await invoke<string>('get_credential', { service: 'aria-ai-keys', username: providerId });
+    if (key) return key;
+  } catch {}
+  return localStorage.getItem(`aria_key_${providerId}`);
 }
 
 export async function deleteApiKey(providerId: string): Promise<void> {
   try {
     await invoke('delete_credential', { service: 'aria-ai-keys', username: providerId });
   } catch {}
+  localStorage.removeItem(`aria_key_${providerId}`);
 }
 
 // Helper to parse SSE streams
@@ -99,14 +104,26 @@ export class OllamaProvider implements AIProvider {
   }
 
   async *chat(messages: { role: string; content: string }[], options: ChatOptions): AsyncIterableIterator<string> {
-    // 1. Check if model is installed. If not, trigger download
     const available = await this.listModels();
-    if (!available.includes(options.model)) {
-      if (options.onProgress) options.onProgress(`Model ${options.model} not installed. Pulling...`);
+    
+    // Resolve target model name
+    let targetModel = (options.model || '').trim();
+    if (!targetModel) {
+      targetModel = available[0] || 'qwen2.5:latest';
+    } else {
+      const match = available.find(m => m === targetModel || m.startsWith(targetModel + ':') || targetModel.startsWith(m.split(':')[0]));
+      if (match) {
+        targetModel = match;
+      }
+    }
+
+    // 1. Check if model is installed. If not, trigger download
+    if (!available.includes(targetModel) && targetModel) {
+      if (options.onProgress) options.onProgress(`Model ${targetModel} not installed. Pulling...`);
       try {
         const pullRes = await fetch(`${this.baseUrl}/api/pull`, {
           method: 'POST',
-          body: JSON.stringify({ name: options.model, stream: true })
+          body: JSON.stringify({ name: targetModel, stream: true })
         });
         
         if (pullRes.ok && pullRes.body) {
@@ -139,19 +156,32 @@ export class OllamaProvider implements AIProvider {
       }
     }
 
+    const cleanMessages = messages
+      .filter(m => m && typeof m.content === 'string' && m.content.trim().length > 0)
+      .map(m => ({
+        role: m.role === 'assistant' ? 'assistant' : (m.role === 'system' ? 'system' : 'user'),
+        content: m.content
+      }));
+
     // 2. Run chat completion
     const res = await fetch(`${this.baseUrl}/api/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: options.model,
-        messages: messages.map(m => ({ role: m.role, content: m.content })),
+        model: targetModel,
+        messages: cleanMessages,
         stream: true
       })
     });
 
     if (!res.ok) {
-      throw new Error(`Ollama chat error: ${res.statusText}`);
+      const errText = await res.text().catch(() => '');
+      let detail = res.statusText;
+      try {
+        const parsed = JSON.parse(errText);
+        if (parsed.error) detail = parsed.error;
+      } catch {}
+      throw new Error(`Ollama chat error: ${detail}`);
     }
 
     if (res.body) {
@@ -208,18 +238,31 @@ export class LMStudioProvider implements AIProvider {
   }
 
   async *chat(messages: { role: string; content: string }[], options: ChatOptions): AsyncIterableIterator<string> {
+    let targetModel = (options.model || '').trim();
+    if (!targetModel) {
+      const models = await this.listModels();
+      targetModel = models[0] || 'default';
+    }
+
     const res = await fetch(`${this.baseUrl}/chat/completions`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: options.model,
+        model: targetModel,
         messages: messages.map(m => ({ role: m.role, content: m.content })),
         stream: true
       })
     });
 
     if (!res.ok) {
-      throw new Error(`LM Studio chat error: ${res.statusText}`);
+      const errText = await res.text().catch(() => '');
+      let detail = res.statusText;
+      try {
+        const parsed = JSON.parse(errText);
+        if (parsed.error?.message) detail = parsed.error.message;
+        else if (parsed.error) detail = String(parsed.error);
+      } catch {}
+      throw new Error(`LM Studio chat error: ${detail}`);
     }
 
     if (res.body) {
