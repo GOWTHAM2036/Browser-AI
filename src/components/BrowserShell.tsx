@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { useBrowserStore } from '../store/browserStore';
 import { TabBar } from './TabBar';
 import { Omnibox } from './Omnibox';
@@ -17,11 +17,13 @@ export const BrowserShell: React.FC = () => {
     activeTabId,
     sidebarOpen,
     readerModeActive,
+    settingsOpen,
     settings,
     addTab,
     closeTab,
     setSidebarOpen,
     setReaderModeActive,
+    setSettingsOpen,
     reloadActiveTab,
     goBackActiveTab,
     goForwardActiveTab,
@@ -30,7 +32,6 @@ export const BrowserShell: React.FC = () => {
     updateTab
   } = useBrowserStore();
 
-  const [showSettings, setShowSettings] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const activeTab = tabs.find(t => t.id === activeTabId);
 
@@ -50,7 +51,7 @@ export const BrowserShell: React.FC = () => {
 
   // Listen for settings open request from SidePanel
   useEffect(() => {
-    const handleOpenSettings = () => setShowSettings(true);
+    const handleOpenSettings = () => setSettingsOpen(true);
     window.addEventListener('aria-open-settings', handleOpenSettings);
     return () => window.removeEventListener('aria-open-settings', handleOpenSettings);
   }, []);
@@ -90,7 +91,7 @@ export const BrowserShell: React.FC = () => {
       if (!activeTabId || !containerRef.current) return;
 
       const rect = containerRef.current.getBoundingClientRect();
-      const isCovered = readerModeActive || showSettings;
+      const isCovered = readerModeActive || settingsOpen;
 
       // If covered, push it off-screen
       const x = isCovered ? -10000 : Math.round(rect.left);
@@ -122,7 +123,7 @@ export const BrowserShell: React.FC = () => {
       observer.observe(containerRef.current);
       return () => observer.disconnect();
     }
-  }, [activeTabId, sidebarOpen, readerModeActive, showSettings, settings.sidebarPosition]);
+  }, [activeTabId, sidebarOpen, readerModeActive, settingsOpen, settings.sidebarPosition]);
 
   // Listen for navigation updates inside the child webview (via custom page-content event)
   // Listen for navigation updates inside any child webview (via global tab-metadata-update event)
@@ -297,11 +298,10 @@ export const BrowserShell: React.FC = () => {
           </button>
           <button
             onClick={() => {
-              console.log("[Toolbar] Settings clicked! Current state showSettings:", showSettings);
-              setShowSettings(!showSettings);
+              setSettingsOpen(!settingsOpen);
             }}
             className={`p-1.5 rounded-lg hover:bg-slate-700 transition-all cursor-pointer ${
-              showSettings ? 'text-[#3b82f6] bg-slate-800' : 'text-slate-400 hover:text-slate-200'
+              settingsOpen ? 'text-[#3b82f6] bg-slate-800' : 'text-slate-400 hover:text-slate-200'
             }`}
             title="Settings"
           >
@@ -328,7 +328,7 @@ export const BrowserShell: React.FC = () => {
       </div>
 
       {/* Settings Overlay — renders on top of EVERYTHING */}
-      {showSettings && <SettingsUI onClose={() => setShowSettings(false)} />}
+      {settingsOpen && <SettingsUI onClose={() => setSettingsOpen(false)} />}
 
       {/* ARIA Agent Visual Cursor & Target Highlight Overlay */}
       <AgentCursor />

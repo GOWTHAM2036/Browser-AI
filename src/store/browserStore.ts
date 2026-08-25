@@ -28,6 +28,7 @@ interface BrowserState {
   sidebarMode: 'chat' | 'intelligence' | 'agent' | 'debug';
   sidebarWidth: number;
   readerModeActive: boolean;
+  settingsOpen: boolean;
   askAiActive: boolean;
   windowWidth: number;
   windowHeight: number;
@@ -41,7 +42,8 @@ interface BrowserState {
   reorderTabs: (srcIndex: number, dstIndex: number) => Promise<void>;
   setSidebarOpen: (open: boolean) => Promise<void>;
   setSidebarMode: (mode: 'chat' | 'intelligence' | 'agent' | 'debug') => void;
-  setReaderModeActive: (active: boolean) => void;
+  setReaderModeActive: (active: boolean) => Promise<void>;
+  setSettingsOpen: (open: boolean) => Promise<void>;
   setAskAiActive: (active: boolean) => void;
   updateWindowSize: (width: number, height: number) => Promise<void>;
 
@@ -80,6 +82,16 @@ const DEFAULT_SETTINGS: BrowserSettings = {
 export const useBrowserStore = create<BrowserState>((set, get) => {
   // Helper to calculate active webview bounds
   const getWebviewBounds = (state: BrowserState) => {
+    // If settings or reader mode are active, push webview off-screen to prevent occlusion
+    if (state.settingsOpen || state.readerModeActive) {
+      return {
+        x: -10000,
+        y: -10000,
+        width: 100,
+        height: 100
+      };
+    }
+
     const topChromeHeight = 80; // 36px titlebar + 44px navigation bar
     const sidebarWidth = state.sidebarOpen ? state.sidebarWidth : 0;
 
@@ -128,6 +140,7 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
     sidebarMode: 'chat',
     sidebarWidth: 360,
     readerModeActive: false,
+    settingsOpen: false,
     askAiActive: false,
     windowWidth: window.innerWidth,
     windowHeight: window.innerHeight,
@@ -298,7 +311,14 @@ export const useBrowserStore = create<BrowserState>((set, get) => {
     },
 
     setSidebarMode: (mode) => set({ sidebarMode: mode }),
-    setReaderModeActive: (active) => set({ readerModeActive: active }),
+    setReaderModeActive: async (active) => {
+      set({ readerModeActive: active });
+      await syncActiveWebviewLayout(get() as BrowserState);
+    },
+    setSettingsOpen: async (open) => {
+      set({ settingsOpen: open });
+      await syncActiveWebviewLayout(get() as BrowserState);
+    },
     setAskAiActive: (active) => set({ askAiActive: active }),
 
     updateWindowSize: async (width, height) => {

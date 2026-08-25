@@ -316,15 +316,21 @@ async fn resize_tab_webview(
             .ok_or_else(|| "Main window not found".to_string())?;
         let scale_factor = window.scale_factor().map_err(|e| e.to_string())?;
 
+        let is_hidden = x < -5000.0 || y < -5000.0 || width <= 0.0 || height <= 0.0;
+
         let physical_x = (x * scale_factor) as i32;
         let physical_y = (y * scale_factor) as i32;
         let physical_width = (width * scale_factor) as u32;
         let physical_height = (height * scale_factor) as u32;
 
-        webview.set_position(tauri::Position::Physical(PhysicalPosition::new(physical_x, physical_y)))
-            .map_err(|e| e.to_string())?;
-        webview.set_size(tauri::Size::Physical(PhysicalSize::new(physical_width, physical_height)))
-            .map_err(|e| e.to_string())?;
+        if is_hidden {
+            let _ = webview.hide();
+        } else {
+            let _ = webview.show();
+        }
+
+        let _ = webview.set_position(tauri::Position::Physical(PhysicalPosition::new(physical_x, physical_y)));
+        let _ = webview.set_size(tauri::Size::Physical(PhysicalSize::new(physical_width, physical_height)));
     }
     Ok(())
 }
