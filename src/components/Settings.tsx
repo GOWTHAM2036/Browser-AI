@@ -3,7 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { useBrowserStore } from '../store/browserStore';
 import { saveApiKey, getApiKey, deleteApiKey, providers, getActiveProvider } from '../services/ai';
 import { dbClearHistory, dbClearTabs } from '../services/db';
-import { Settings, Cpu, Palette, Shield, Keyboard, Check, AlertCircle, RefreshCw, Camera, Mic, Video, Volume2 } from 'lucide-react';
+import { Settings, Cpu, Palette, Shield, Keyboard, Check, AlertCircle, RefreshCw, Camera, Mic, Video, Volume2, Eye, EyeOff } from 'lucide-react';
 
 export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const { settings, updateSettings } = useBrowserStore();
@@ -20,8 +20,9 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   }, [notification]);
 
   // AI Connection Test State
-  const [selectedProviderId, setSelectedProviderId] = useState(settings.aiProvider || 'duckduckgo');
+  const [selectedProviderId, setSelectedProviderId] = useState(settings.aiProvider || 'openrouter');
   const [apiKeyInput, setApiKeyInput] = useState('');
+  const [showApiKey, setShowApiKey] = useState(false);
   const [customUrlInput, setCustomUrlInput] = useState('');
   const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState(settings.aiModel || '');
@@ -202,7 +203,7 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   };
 
   return (
-    <div className="absolute inset-0 bg-[#0b0f19] z-[9999] flex flex-col text-slate-200 select-none">
+    <div className="fixed inset-0 bg-[#0b0f19] z-[9999] flex flex-col text-slate-200 select-none">
       {/* Top Header */}
       <div className="flex items-center justify-between px-6 py-4 border-b border-slate-800 bg-[#0f172a]">
         <div className="flex items-center gap-2 font-bold text-sm text-white">
@@ -357,7 +358,11 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
                 <label className="text-xs font-semibold text-slate-300">Choose AI Provider</label>
                 <select
                   value={selectedProviderId}
-                  onChange={(e) => setSelectedProviderId(e.target.value)}
+                  onChange={(e) => {
+                    setSelectedProviderId(e.target.value);
+                    setTestStatus('idle');
+                    setTestError('');
+                  }}
                   className="bg-[#0b0f19] border border-slate-700 rounded-lg py-2 px-3 text-xs outline-none focus:border-blue-500 max-w-md cursor-pointer"
                 >
                   {providers.map(p => (
@@ -384,15 +389,25 @@ export const SettingsUI: React.FC<{ onClose: () => void }> = ({ onClose }) => {
               {selectedProviderId !== 'ollama' && selectedProviderId !== 'lm_studio' && (
                 <div className="flex flex-col gap-1.5">
                   <label className="text-xs font-semibold text-slate-300">API Access Key</label>
-                  <input
-                    type="password"
-                    value={apiKeyInput}
-                    onChange={(e) => setApiKeyInput(e.target.value)}
-                    placeholder="Enter credential key..."
-                    className="bg-[#0b0f19] border border-slate-700 rounded-lg py-2 px-3 text-xs outline-none focus:border-blue-500 max-w-md"
-                  />
+                  <div className="relative max-w-md">
+                    <input
+                      type={showApiKey ? "text" : "password"}
+                      value={apiKeyInput}
+                      onChange={(e) => setApiKeyInput(e.target.value)}
+                      placeholder={`Enter ${selectedProviderId} API key...`}
+                      className="w-full bg-[#0b0f19] border border-slate-700 rounded-lg py-2 pl-3 pr-10 text-xs outline-none focus:border-blue-500 font-mono text-slate-200"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey(!showApiKey)}
+                      className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 p-1 cursor-pointer"
+                      title={showApiKey ? "Hide API Key" : "Show API Key"}
+                    >
+                      {showApiKey ? <EyeOff size={14} /> : <Eye size={14} />}
+                    </button>
+                  </div>
                   <span className="text-[10px] text-slate-500">
-                    *Keys are saved securely in your native system keychain/credentials store, never in LocalStorage.
+                    *Keys are saved securely in your native system keychain/credentials store, never exposed.
                   </span>
                 </div>
               )}

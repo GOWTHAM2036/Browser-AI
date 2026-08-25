@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useRef } from 'react';
 import { useBrowserStore } from '../store/browserStore';
 import { TabBar } from './TabBar';
 import { Omnibox } from './Omnibox';
@@ -17,11 +17,13 @@ export const BrowserShell: React.FC = () => {
     activeTabId,
     sidebarOpen,
     readerModeActive,
+    settingsOpen,
     settings,
     addTab,
     closeTab,
     setSidebarOpen,
     setReaderModeActive,
+    setSettingsOpen,
     reloadActiveTab,
     goBackActiveTab,
     goForwardActiveTab,
@@ -30,7 +32,6 @@ export const BrowserShell: React.FC = () => {
     updateTab
   } = useBrowserStore();
 
-  const [showSettings, setShowSettings] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
   const activeTab = tabs.find(t => t.id === activeTabId);
 
@@ -46,6 +47,13 @@ export const BrowserShell: React.FC = () => {
     };
     window.addEventListener('resize', handleResize);
     return () => window.removeEventListener('resize', handleResize);
+  }, []);
+
+  // Listen for settings open request from SidePanel
+  useEffect(() => {
+    const handleOpenSettings = () => setSettingsOpen(true);
+    window.addEventListener('aria-open-settings', handleOpenSettings);
+    return () => window.removeEventListener('aria-open-settings', handleOpenSettings);
   }, []);
 
   // Global Keyboard Shortcuts
@@ -83,20 +91,13 @@ export const BrowserShell: React.FC = () => {
       if (!activeTabId || !containerRef.current) return;
 
       const rect = containerRef.current.getBoundingClientRect();
-      const isCovered = readerModeActive || showSettings;
+      const isCovered = readerModeActive || settingsOpen;
 
       // If covered, push it off-screen
-      const x = isCovered ? -3000 : rect.left;
-      const y = isCovered ? -3000 : rect.top;
-      const width = isCovered ? 100 : rect.width;
-      const height = isCovered ? 100 : rect.height;
-
-      console.log("[Webview Bounds Sync] measured rect:", {
-        left: rect.left,
-        top: rect.top,
-        width: rect.width,
-        height: rect.height
-      }, "-> target layout:", { x, y, width, height, isCovered });
+      const x = isCovered ? -10000 : Math.round(rect.left);
+      const y = isCovered ? -10000 : Math.round(rect.top);
+      const width = isCovered ? 100 : Math.max(100, Math.round(rect.width));
+      const height = isCovered ? 100 : Math.max(100, Math.round(rect.height));
 
       try {
         await invoke('resize_tab_webview', {
@@ -122,7 +123,7 @@ export const BrowserShell: React.FC = () => {
       observer.observe(containerRef.current);
       return () => observer.disconnect();
     }
-  }, [activeTabId, sidebarOpen, readerModeActive, showSettings, settings.sidebarPosition]);
+  }, [activeTabId, sidebarOpen, readerModeActive, settingsOpen, settings.sidebarPosition]);
 
   // Listen for navigation updates inside the child webview (via custom page-content event)
   // Listen for navigation updates inside any child webview (via global tab-metadata-update event)
@@ -172,59 +173,6 @@ export const BrowserShell: React.FC = () => {
       if (unlisten) unlisten();
     };
   }, []);
-
-  // Periodic active-tab metadata injector (checks title, URL, canGoBack/Forward in DOM/browser history)
-  useEffect(() => {
-    if (!activeTabId) return;
-
-    const injectMetadataListener = async () => {
-      const js = `
-        (function() {
-          const sendMetadata = () => {
-            try {
-              let favicon = '';
-              const link = document.querySelector('link[rel*="icon"]');
-              if (link) {
-                favicon = link.href;
-              } else {
-                favicon = window.location.origin + '/favicon.ico';
-              }
-              const canGoBack = window.navigation ? window.navigation.canGoBack : false;
-              const canGoForward = window.navigation ? window.navigation.canGoForward : false;
-              const payload = JSON.stringify({
-                type: 'page_load',
-                url: window.location.href,
-                title: document.title,
-                favicon: favicon,
-                canGoBack: canGoBack,
-                canGoForward: canGoForward
-              });
-              try {
-                window.location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(payload);
-              } catch(err) {}
-            } catch (e) {}
-          };
-          
-          if (document.readyState === 'complete') {
-            sendMetadata();
-          } else {
-            window.addEventListener('load', sendMetadata);
-          }
-        })();
-      `;
-      try {
-        await invoke('eval_tab_webview', { webviewLabel: `tab-${activeTabId}`, js: js });
-      } catch {}
-    };
-
-    // Inject immediately and run periodically
-    injectMetadataListener();
-    const interval = setInterval(injectMetadataListener, 2000);
-
-    return () => {
-      clearInterval(interval);
-    };
-  }, [activeTabId]);
 
   // TitleBar Handlers
   const handleMinimize = async () => {
@@ -350,11 +298,10 @@ export const BrowserShell: React.FC = () => {
           </button>
           <button
             onClick={() => {
-              console.log("[Toolbar] Settings clicked! Current state showSettings:", showSettings);
-              setShowSettings(!showSettings);
+              setSettingsOpen(!settingsOpen);
             }}
             className={`p-1.5 rounded-lg hover:bg-slate-700 transition-all cursor-pointer ${
-              showSettings ? 'text-[#3b82f6] bg-slate-800' : 'text-slate-400 hover:text-slate-200'
+              settingsOpen ? 'text-[#3b82f6] bg-slate-800' : 'text-slate-400 hover:text-slate-200'
             }`}
             title="Settings"
           >
@@ -374,14 +321,14 @@ export const BrowserShell: React.FC = () => {
 
           {/* Reader Mode Overlay */}
           <ReaderMode />
-
-          {/* Settings Overlay */}
-          {showSettings && <SettingsUI onClose={() => setShowSettings(false)} />}
         </div>
 
         {/* AI Side Panel */}
         <SidePanel />
       </div>
+
+      {/* Settings Overlay — renders on top of EVERYTHING */}
+      {settingsOpen && <SettingsUI onClose={() => setSettingsOpen(false)} />}
 
       {/* ARIA Agent Visual Cursor & Target Highlight Overlay */}
       <AgentCursor />
