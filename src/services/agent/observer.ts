@@ -35,54 +35,30 @@ export const observationScript = `
     function sendIpc(payload) {
       try {
         var rawStr = String(payload);
-        var CHUNK_SIZE = 1000;
+        var CHUNK_SIZE = 600;
         var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
         var msgId = 'msg_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
 
-        function fallbackLocationDispatch() {
-          if (total === 1 && rawStr.length < 1500) {
-            console.log('[OBSERVE-IPC-SEND] messageId=' + msgId + ' payloadBytes=' + rawStr.length + ' transport=single');
-            location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
-            return;
-          }
-
-          console.log('[OBSERVE-IPC-SEND] messageId=' + msgId + ' payloadBytes=' + rawStr.length + ' transport=chunked total=' + total);
-          for (var i = 0; i < total; i++) {
-            (function(idx) {
-              setTimeout(function() {
-                var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
-                var encoded = encodeURIComponent(slice);
-                console.log('[OBSERVE-IPC-CHUNK-SEND] messageId=' + msgId + ' index=' + idx + ' total=' + total + ' encodedBytes=' + encoded.length);
-                var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
-                               '&index=' + idx +
-                               '&total=' + total +
-                               '&data=' + encoded;
-                location.href = chunkUrl;
-              }, idx * 25);
-            })(i);
-          }
+        if (total === 1 && encodeURIComponent(rawStr).length < 1500) {
+          console.log('[OBSERVE-IPC-SEND] messageId=' + msgId + ' payloadBytes=' + rawStr.length + ' transport=single');
+          location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
+          return;
         }
 
-        // Try custom protocol fetch first (non-navigating, zero URL limit, zero beforeunload)
-        var dispatched = false;
-        try {
-          if (typeof fetch === 'function') {
-            fetch('http://aria-ipc.localhost/data', {
-              method: 'POST',
-              headers: { 'Content-Type': 'text/plain' },
-              body: rawStr,
-              mode: 'no-cors'
-            }).then(function() {
-              console.log('[OBSERVE-IPC-SEND] messageId=' + msgId + ' payloadBytes=' + rawStr.length + ' transport=custom-protocol');
-            }).catch(function() {
-              fallbackLocationDispatch();
-            });
-            dispatched = true;
-          }
-        } catch(err) {}
-
-        if (!dispatched) {
-          fallbackLocationDispatch();
+        console.log('[OBSERVE-IPC-SEND] messageId=' + msgId + ' payloadBytes=' + rawStr.length + ' transport=chunked total=' + total);
+        for (var i = 0; i < total; i++) {
+          (function(idx) {
+            setTimeout(function() {
+              var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+              var encoded = encodeURIComponent(slice);
+              console.log('[OBSERVE-IPC-CHUNK-SEND] messageId=' + msgId + ' index=' + idx + ' total=' + total + ' encodedBytes=' + encoded.length);
+              var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
+                             '&index=' + idx +
+                             '&total=' + total +
+                             '&data=' + encoded;
+              location.href = chunkUrl;
+            }, idx * 25);
+          })(i);
         }
       } catch(e) {}
     }

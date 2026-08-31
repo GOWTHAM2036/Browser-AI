@@ -100,6 +100,15 @@ test('observationScript uses safe chunked IPC transport', async () => {
   assert.ok(observationScript.includes('CHUNK_SIZE'));
   assert.ok(observationScript.includes('msgId'));
   assert.ok(observationScript.includes('location.href'));
+  assert.ok(!observationScript.includes('aria-ipc.localhost'));
+});
+
+test('quizExtractScript uses reliable tauri-ipc-bridge transport and valid DOM selectors', async () => {
+  const { quizExtractScript } = await loadQuizSolver();
+  assert.ok(quizExtractScript.includes('https://tauri-ipc-bridge/data'));
+  assert.ok(quizExtractScript.includes('QUIZ_SNAPSHOT:'));
+  assert.ok(quizExtractScript.includes('location.href'));
+  assert.ok(!quizExtractScript.includes('aria-ipc.localhost'), 'Should not use broken aria-ipc.localhost fetch');
 });
 
 test('large DOM observation (100+ elements, 60KB) is chunked below URL limits and reassembles losslessly', async () => {
@@ -231,4 +240,20 @@ async function loadAgentObserver() {
     external: ['@tauri-apps/api/core', '@tauri-apps/api/event']
   });
   return import(pathToFileURL(join(outDir, 'observer.js')).href + '?cache=' + Date.now());
+}
+
+async function loadQuizSolver() {
+  await rm(outDir, { recursive: true, force: true });
+  await mkdir(outDir, { recursive: true });
+  await esbuild.build({
+    entryPoints: [
+      join(repoRoot, 'src/services/agent/quizSolver.ts')
+    ],
+    outfile: join(outDir, 'quizSolver.js'),
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    external: ['@tauri-apps/api/core', '@tauri-apps/api/event', '@tauri-apps/plugin-http', 'zustand']
+  });
+  return import(pathToFileURL(join(outDir, 'quizSolver.js')).href + '?cache=' + Date.now());
 }
