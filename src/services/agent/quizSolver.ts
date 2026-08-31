@@ -36,126 +36,176 @@ export function cancelActiveQuizRun(): void {
   activeQuizRunId = null;
 }
 
-/** DOM extraction script to identify questions, options, images, and progress */
+/** DOM extraction script to identify questions, options, images, and progress across main document & iframes */
 export const quizExtractScript = `
 (function() {
   function sendIpc(payload) {
     try {
       var rawStr = String(payload);
-      var CHUNK_SIZE = 1000;
-      var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
-      var msgId = 'quiz_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
-
-      function fallbackDispatch() {
-        if (total === 1 && rawStr.length < 1500) {
-          location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
-          return;
-        }
-        for (var i = 0; i < total; i++) {
-          (function(idx) {
-            setTimeout(function() {
-              var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
-              var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
-                             '&index=' + idx +
-                             '&total=' + total +
-                             '&data=' + encodeURIComponent(slice);
-              location.href = chunkUrl;
-            }, idx * 25);
-          })(i);
-        }
-      }
-
-      if (typeof fetch === 'function') {
-        fetch('http://aria-ipc.localhost/data', {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain' },
-          body: rawStr,
-          mode: 'no-cors'
-        }).catch(function() {
-          fallbackDispatch();
-        });
-      } else {
-        fallbackDispatch();
-      }
+      var encoded = encodeURIComponent(rawStr);
+      location.href = 'https://tauri-ipc-bridge/data?payload=' + encoded;
     } catch(e) {}
   }
 
+  function getAllDocs() {
+    var docs = [document];
+    try {
+      var iframes = document.querySelectorAll('iframe, frame');
+      for (var f = 0; f < iframes.length; f++) {
+        try {
+          var fDoc = iframes[f].contentDocument || (iframes[f].contentWindow && iframes[f].contentWindow.document);
+          if (fDoc && docs.indexOf(fDoc) === -1) {
+            docs.push(fDoc);
+            try {
+              var subIframes = fDoc.querySelectorAll('iframe, frame');
+              for (var sf = 0; sf < subIframes.length; sf++) {
+                var sfDoc = subIframes[sf].contentDocument || (subIframes[sf].contentWindow && subIframes[sf].contentWindow.document);
+                if (sfDoc && docs.indexOf(sfDoc) === -1) {
+                  docs.push(sfDoc);
+                }
+              }
+            } catch(e2) {}
+          }
+        } catch(e1) {}
+      }
+    } catch(e) {}
+    return docs;
+  }
+
   try {
+    var docs = getAllDocs();
+    var allPageText = '';
+    for (var d = 0; d < docs.length; d++) {
+      try {
+        if (docs[d].body) {
+          allPageText += ' ' + (docs[d].body.innerText || docs[d].body.textContent || '');
+        }
+      } catch(e) {}
+    }
+
     // 1. Check for completion modal or results dialog
     var isCompleted = false;
-    var modal = document.querySelector('[role="dialog"], dialog, .modal, [class*="modal"], [class*="congrats"], [class*="Result"]');
-    var pageText = document.body ? document.body.innerText : '';
-    if (pageText.includes('Congrats!') || pageText.includes('You did well') || pageText.includes('Practice Completed') || pageText.includes('Review Mistakes') || (pageText.includes('Passed') && pageText.includes('/'))) {
+    var completedPhrases = [
+      'Congrats!', 'You did well', 'Practice Completed', 'Review Mistakes',
+      'Assessment Completed', 'Quiz Completed', 'Test Submitted', 'Your Score:',
+      'Submitted Successfully', 'Practice Finished', 'Test Finished'
+    ];
+    for (var cp = 0; cp < completedPhrases.length; cp++) {
+      if (allPageText.includes(completedPhrases[cp])) {
+        isCompleted = true;
+        break;
+      }
+    }
+    if (!isCompleted && allPageText.includes('Passed') && allPageText.includes('/')) {
       isCompleted = true;
     }
 
     // 2. Extract Question text
     var questionText = '';
-    var qContainers = document.querySelectorAll('#generic-question-wrapper-id, [class*="QuestionContent"], [class*="QuestionDescription"], [class*="question-container"], [data-testid="question-text"], [class*="QuestionText"]');
-    if (qContainers.length > 0) {
-      questionText = qContainers[0].innerText.trim();
-    } else {
-      // Fallback: extract heading or prominent question paragraph
-      var headings = document.querySelectorAll('h1, h2, h3, h4, [class*="title"], [class*="content"] p');
-      for (var h = 0; h < headings.length; h++) {
-        var t = headings[h].innerText.trim();
-        if (t.length > 20 && !t.includes('INSTRUCTIONS') && !t.includes('SCORE:')) {
-          questionText = t;
+    var qSelector = '#generic-question-wrapper-id, [class*="QuestionContent"], [class*="QuestionDescription"], [class*="question-container"], [data-testid="question-text"], [class*="QuestionText"], [class*="question-text"], [class*="questionText"], [class*="question_title"], [class*="Question_title"], [data-testid*="question"], [class*="question-title"], [class*="prompt"], [class*="mcq-question"]';
+    
+    for (var d1 = 0; d1 < docs.length; d1++) {
+      var qContainers = docs[d1].querySelectorAll(qSelector);
+      if (qContainers.length > 0) {
+        var text = (qContainers[0].innerText || qContainers[0].textContent || '').trim();
+        if (text.length > 10) {
+          questionText = text;
           break;
         }
+      }
+    }
+
+    if (!questionText) {
+      // Fallback: extract heading or prominent question paragraph
+      for (var d2 = 0; d2 < docs.length; d2++) {
+        var headings = docs[d2].querySelectorAll('h1, h2, h3, h4, [class*="title"], [class*="content"] p, .question, .prompt, [role="main"] p, p');
+        for (var h = 0; h < headings.length; h++) {
+          var t = (headings[h].innerText || headings[h].textContent || '').trim();
+          if (t.length > 15 && !t.includes('INSTRUCTIONS') && !t.includes('SCORE:') && !t.includes('Questions Attempted')) {
+            questionText = t;
+            break;
+          }
+        }
+        if (questionText) break;
       }
     }
 
     // 3. Extract Image URL if present
     var imageUrl = '';
-    var imgs = document.querySelectorAll('img[alt="image"], img[class*="question"], [class*="Question"] img, img[src*="APTITUDE_IMAGES"], img[src*="VENN"], img[src*="CUBES"], img[src*="amazonaws.com"]');
-    if (imgs.length > 0) {
+    var imgSelector = 'img[alt="image"], img[class*="question"], [class*="Question"] img, img[src*="APTITUDE_IMAGES"], img[src*="VENN"], img[src*="CUBES"], img[src*="amazonaws.com"], .question-container img, [class*="question"] img, img';
+    for (var d3 = 0; d3 < docs.length; d3++) {
+      var imgs = docs[d3].querySelectorAll(imgSelector);
       for (var im = 0; im < imgs.length; im++) {
-        var src = imgs[im].src || '';
-        if (src && !src.includes('profile') && !src.includes('logo') && !src.includes('avatar')) {
-          imageUrl = src;
-          break;
+        var src = imgs[im].src || imgs[im].getAttribute('src') || '';
+        if (src && !src.includes('profile') && !src.includes('logo') && !src.includes('avatar') && !src.includes('icon') && !src.includes('data:image/svg')) {
+          var rect = imgs[im].getBoundingClientRect();
+          if (rect.width > 40 && rect.height > 40) {
+            imageUrl = src;
+            break;
+          }
         }
       }
+      if (imageUrl) break;
     }
 
     // 4. Extract Options
     var options = [];
-    var optionLabels = document.querySelectorAll('label[id="radioButton"], label[data-testid], [class*="OptionComponent"], [class*="radioButtonLabel"], [class*="option-item"], input[type="radio"], [role="radio"]');
-    
+    var optSelector = 'label[id="radioButton"], label[data-testid], [class*="OptionComponent"], [class*="radioButtonLabel"], [class*="option-item"], [class*="Option"], [class*="option"], [data-testid*="option"], [data-testid*="choice"], [data-testid*="answer"], [role="radio"], [role="checkbox"], input[type="radio"], input[type="checkbox"], li[class*="choice"], li[class*="option"]';
     var seenTexts = {};
-    for (var o = 0; o < optionLabels.length; o++) {
-      var el = optionLabels[o];
-      var text = el.innerText ? el.innerText.trim() : '';
-      var testId = el.getAttribute('data-testid') || '';
-      var inputEl = el.tagName === 'INPUT' ? el : el.querySelector('input');
-      var val = inputEl ? inputEl.value : (el.getAttribute('value') || '');
 
-      if (!text && testId) text = testId;
-      if (!text && inputEl && inputEl.value) text = inputEl.value;
+    for (var d4 = 0; d4 < docs.length; d4++) {
+      var optionLabels = docs[d4].querySelectorAll(optSelector);
+      for (var o = 0; o < optionLabels.length; o++) {
+        var el = optionLabels[o];
+        var text = (el.innerText || el.textContent || '').trim();
+        var testId = el.getAttribute('data-testid') || '';
+        var inputEl = el.tagName === 'INPUT' ? el : el.querySelector('input');
+        var val = inputEl ? inputEl.value : (el.getAttribute('value') || '');
 
-      if (text && !seenTexts[text] && text !== 'SUBMIT' && text !== 'SHOW ANSWER' && text !== 'SKIP' && text !== 'NEXT') {
-        seenTexts[text] = true;
-        options.push({
-          id: testId || text,
-          text: text,
-          value: val,
-          testId: testId
-        });
+        if (!text && testId) text = testId;
+        if (!text && inputEl && inputEl.value && inputEl.value !== 'on') text = inputEl.value;
+        if (!text && el.parentElement) {
+          text = (el.parentElement.innerText || el.parentElement.textContent || '').trim();
+        }
+
+        var upper = text.toUpperCase();
+        if (text && !seenTexts[text] && upper !== 'SUBMIT' && upper !== 'SHOW ANSWER' && upper !== 'SKIP' && upper !== 'NEXT' && upper !== 'SAVE & NEXT' && upper !== 'PREVIOUS' && upper !== 'CLEAR') {
+          seenTexts[text] = true;
+          options.push({
+            id: testId || text,
+            text: text,
+            value: val,
+            testId: testId
+          });
+        }
       }
     }
 
     // 5. Extract Progress & Score
-    var scoreMatch = pageText.match(/SCORE:\s*(\d+)/i) || pageText.match(/Score:\s*(\d+)/i);
+    var scoreMatch = allPageText.match(/SCORE:\s*(\d+)/i) || allPageText.match(/Score:\s*(\d+)/i) || allPageText.match(/Score:\s*(\d+\/\d+)/i);
     var scoreText = scoreMatch ? scoreMatch[1] : '';
 
-    var progMatch = pageText.match(/Questions Attempted:\s*(\d+\/\d+)/i) || pageText.match(/(\d+\/\d+)/);
-    var progressText = progMatch ? progMatch[1] : '';
+    var progMatch = allPageText.match(/Questions Attempted:\s*(\d+\/\d+)/i) || allPageText.match(/Question\s*(\d+\s*of\s*\d+)/i) || allPageText.match(/(\d+\/\d+)/);
+    var progressText = progMatch ? (progMatch[1] || progMatch[0]) : '';
 
     // 6. Check Action Buttons
-    var buttons = Array.from(document.querySelectorAll('button'));
-    var hasSubmit = buttons.some(function(b) { return b.innerText.trim().toUpperCase() === 'SUBMIT'; });
-    var hasNext = buttons.some(function(b) { return b.innerText.trim().toUpperCase() === 'NEXT'; });
+    var hasSubmit = false;
+    var hasNext = false;
+    for (var d5 = 0; d5 < docs.length; d5++) {
+      var buttons = Array.from(docs[d5].querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a[class*="btn"]'));
+      if (buttons.some(function(b) {
+        var t = (b.innerText || b.value || b.textContent || '').trim().toUpperCase();
+        return t === 'SUBMIT' || t === 'SAVE & NEXT' || t === 'SUBMIT ANSWER' || t === 'CONFIRM';
+      })) {
+        hasSubmit = true;
+      }
+      if (buttons.some(function(b) {
+        var t = (b.innerText || b.value || b.textContent || '').trim().toUpperCase();
+        return t === 'NEXT' || t === 'NEXT QUESTION' || t === 'CONTINUE' || t === 'SUBMIT & NEXT';
+      })) {
+        hasNext = true;
+      }
+    }
 
     var data = {
       isCompleted: isCompleted,
@@ -168,6 +218,7 @@ export const quizExtractScript = `
       hasNext: hasNext
     };
 
+    try { window.__QUIZ_SNAPSHOT__ = data; } catch(e) {}
     sendIpc('QUIZ_SNAPSHOT:' + JSON.stringify(data));
   } catch(err) {
     sendIpc('QUIZ_SNAPSHOT_ERROR:' + String(err));
@@ -180,18 +231,59 @@ export async function observeQuizPage(tabId: string): Promise<QuizQuestionData> 
   return new Promise(async (resolve, reject) => {
     const eventName = `page-content-tab-${tabId}`;
     let unlisten: (() => void) | null = null;
+    let settled = false;
+
+    const cleanup = () => {
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
+      }
+      clearTimeout(timeout);
+      clearTimeout(fallbackPollTimer1);
+      clearTimeout(fallbackPollTimer2);
+    };
 
     const timeout = setTimeout(() => {
-      if (unlisten) unlisten();
-      reject(new Error('Quiz observation timed out after 8s'));
-    }, 8000);
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('Quiz observation timed out after 10s'));
+    }, 10000);
+
+    // Fallback polling: If no event received after 1.2s, re-check window.__QUIZ_SNAPSHOT__
+    const fallbackPollTimer1 = setTimeout(async () => {
+      if (settled) return;
+      try {
+        const pollJs = `
+          (function() {
+            try {
+              var s = window.__QUIZ_SNAPSHOT__;
+              if (s) {
+                location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent('QUIZ_SNAPSHOT:' + JSON.stringify(s));
+              } else {
+                ${quizExtractScript}
+              }
+            } catch(e) {}
+          })();
+        `;
+        await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: pollJs });
+      } catch (e) {}
+    }, 1200);
+
+    const fallbackPollTimer2 = setTimeout(async () => {
+      if (settled) return;
+      try {
+        await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: quizExtractScript });
+      } catch (e) {}
+    }, 3500);
 
     try {
       unlisten = await listen<string>(eventName, (event) => {
         const raw = String(event.payload || '');
         if (raw.startsWith('QUIZ_SNAPSHOT:')) {
-          clearTimeout(timeout);
-          if (unlisten) unlisten();
+          if (settled) return;
+          settled = true;
+          cleanup();
           try {
             const parsed = JSON.parse(raw.substring('QUIZ_SNAPSHOT:'.length));
             resolve(parsed);
@@ -199,8 +291,9 @@ export async function observeQuizPage(tabId: string): Promise<QuizQuestionData> 
             reject(e);
           }
         } else if (raw.startsWith('QUIZ_SNAPSHOT_ERROR:')) {
-          clearTimeout(timeout);
-          if (unlisten) unlisten();
+          if (settled) return;
+          settled = true;
+          cleanup();
           reject(new Error(raw));
         }
       });
@@ -210,52 +303,117 @@ export async function observeQuizPage(tabId: string): Promise<QuizQuestionData> 
         js: quizExtractScript
       });
     } catch (err) {
-      clearTimeout(timeout);
-      if (unlisten) unlisten();
+      if (settled) return;
+      settled = true;
+      cleanup();
       reject(err);
     }
   });
 }
 
-/** Injects synthetic click on the selected option, clicks SUBMIT, then clicks NEXT */
+/** Injects synthetic click on the selected option, clicks SUBMIT, then clicks NEXT across main document & iframes */
 export async function executeQuizAnswer(tabId: string, answerText: string): Promise<{ success: boolean; scoreDelta?: number }> {
   const script = `
   (function() {
+    function getAllDocs() {
+      var docs = [document];
+      try {
+        var iframes = document.querySelectorAll('iframe, frame');
+        for (var f = 0; f < iframes.length; f++) {
+          try {
+            var fDoc = iframes[f].contentDocument || (iframes[f].contentWindow && iframes[f].contentWindow.document);
+            if (fDoc && docs.indexOf(fDoc) === -1) {
+              docs.push(fDoc);
+              try {
+                var subIframes = fDoc.querySelectorAll('iframe, frame');
+                for (var sf = 0; sf < subIframes.length; sf++) {
+                  var sfDoc = subIframes[sf].contentDocument || (subIframes[sf].contentWindow && subIframes[sf].contentWindow.document);
+                  if (sfDoc && docs.indexOf(sfDoc) === -1) docs.push(sfDoc);
+                }
+              } catch(e2) {}
+            }
+          } catch(e1) {}
+        }
+      } catch(e) {}
+      return docs;
+    }
+
     try {
       var target = ${JSON.stringify(answerText.trim())};
-      
-      // 1. Select matching option
+      var docs = getAllDocs();
       var selected = false;
-      var labels = Array.from(document.querySelectorAll('label[id="radioButton"], label[data-testid], [class*="OptionComponent"], [class*="radioButtonLabel"], input[type="radio"], [role="radio"]'));
+      var optSelector = 'label[id="radioButton"], label[data-testid], [class*="OptionComponent"], [class*="radioButtonLabel"], [class*="option-item"], [class*="Option"], [class*="option"], [data-testid*="option"], [data-testid*="choice"], [data-testid*="answer"], [role="radio"], [role="checkbox"], input[type="radio"], input[type="checkbox"], li[class*="choice"], li[class*="option"]';
       
-      for (var i = 0; i < labels.length; i++) {
-        var l = labels[i];
-        var txt = (l.innerText || '').trim();
-        var tid = l.getAttribute('data-testid') || '';
-        if (txt === target || tid === target || (target.length > 0 && txt.includes(target)) || (tid && tid.includes(target))) {
-          l.click();
-          var input = l.tagName === 'INPUT' ? l : l.querySelector('input');
-          if (input) {
-            input.checked = true;
-            input.dispatchEvent(new Event('change', { bubbles: true }));
+      for (var d = 0; d < docs.length && !selected; d++) {
+        var labels = Array.from(docs[d].querySelectorAll(optSelector));
+        for (var i = 0; i < labels.length; i++) {
+          var l = labels[i];
+          var txt = (l.innerText || l.textContent || '').trim();
+          var tid = l.getAttribute('data-testid') || '';
+          var val = l.getAttribute('value') || '';
+          var matches = (txt === target || tid === target || val === target) ||
+                        (target.length > 2 && (txt.includes(target) || tid.includes(target)));
+          if (matches) {
+            l.click();
+            var input = l.tagName === 'INPUT' ? l : l.querySelector('input');
+            if (input) {
+              input.checked = true;
+              input.dispatchEvent(new Event('change', { bubbles: true }));
+              input.dispatchEvent(new Event('input', { bubbles: true }));
+              input.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+            }
+            selected = true;
+            break;
           }
-          selected = true;
-          break;
+        }
+      }
+
+      // If exact string wasn't found, try matching by clean option text without index prefixes
+      if (!selected) {
+        var cleanTarget = target.replace(/^[0-9]+\\.\\s*/, '').trim().toLowerCase();
+        for (var d2 = 0; d2 < docs.length && !selected; d2++) {
+          var labels2 = Array.from(docs[d2].querySelectorAll(optSelector));
+          for (var j = 0; j < labels2.length; j++) {
+            var l2 = labels2[j];
+            var t2 = (l2.innerText || l2.textContent || '').trim().toLowerCase();
+            if (t2 && (t2.includes(cleanTarget) || cleanTarget.includes(t2))) {
+              l2.click();
+              var inp = l2.tagName === 'INPUT' ? l2 : l2.querySelector('input');
+              if (inp) {
+                inp.checked = true;
+                inp.dispatchEvent(new Event('change', { bubbles: true }));
+              }
+              selected = true;
+              break;
+            }
+          }
         }
       }
 
       // 2. Click SUBMIT if present
       setTimeout(function() {
-        var buttons = Array.from(document.querySelectorAll('button'));
-        var submitBtn = buttons.find(function(b) { return b.innerText.trim().toUpperCase() === 'SUBMIT'; });
+        var submitBtn = null;
+        for (var d3 = 0; d3 < docs.length && !submitBtn; d3++) {
+          var buttons = Array.from(docs[d3].querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a[class*="btn"]'));
+          submitBtn = buttons.find(function(b) {
+            var t = (b.innerText || b.value || b.textContent || '').trim().toUpperCase();
+            return t === 'SUBMIT' || t === 'SAVE & NEXT' || t === 'SUBMIT ANSWER' || t === 'CONFIRM';
+          });
+        }
         if (submitBtn) {
           submitBtn.click();
         }
 
         // 3. Click NEXT if present after short delay
         setTimeout(function() {
-          var nextButtons = Array.from(document.querySelectorAll('button'));
-          var nextBtn = nextButtons.find(function(b) { return b.innerText.trim().toUpperCase() === 'NEXT'; });
+          var nextBtn = null;
+          for (var d4 = 0; d4 < docs.length && !nextBtn; d4++) {
+            var nextButtons = Array.from(docs[d4].querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"], a[class*="btn"]'));
+            nextBtn = nextButtons.find(function(b) {
+              var t = (b.innerText || b.value || b.textContent || '').trim().toUpperCase();
+              return t === 'NEXT' || t === 'NEXT QUESTION' || t === 'CONTINUE' || t === 'SUBMIT & NEXT';
+            });
+          }
           if (nextBtn) {
             nextBtn.click();
           }
@@ -390,7 +548,7 @@ export async function runAutoQuizSolver(
     }
 
     // 2. Check if test is completed
-    if (questionState.isCompleted || (questionState.options.length === 0 && !questionState.hasSubmit)) {
+    if (questionState.isCompleted || (questionState.options.length === 0 && !questionState.hasSubmit && !questionState.hasNext)) {
       callbacks.onTimelineUpdate({
         id: `step-${questionIndex}-complete`,
         timestamp: new Date().toLocaleTimeString(),
@@ -404,7 +562,7 @@ export async function runAutoQuizSolver(
       return;
     }
 
-    callbacks.onLog(`[QUIZ_SOLVER] Q${questionIndex}: "${questionState.questionText.slice(0, 60)}..." (Options: ${questionState.options.length})`);
+    callbacks.onLog(`[QUIZ_SOLVER] Q${questionIndex}: "${(questionState.questionText || 'Question').slice(0, 60)}..." (Options: ${questionState.options.length})`);
 
     // 3. Solve with AI
     callbacks.onStatusUpdate(`Solving Question ${questionIndex}...`, questionIndex);
