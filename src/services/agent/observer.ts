@@ -32,8 +32,21 @@ export interface AgentObservation {
 /** Runs in the child native webview. Returns a rich, compact DOM snapshot with aria-agent-id attributes. */
 export const observationScript = `
   (function () {
+    try {
+      window.onbeforeunload = null;
+      document.onbeforeunload = null;
+      window.addEventListener('beforeunload', function(e) {
+        e.stopImmediatePropagation();
+        delete e.returnValue;
+      }, true);
+    } catch(e) {}
+
     function sendIpc(payload) {
       try {
+        try {
+          window.onbeforeunload = null;
+        } catch(eUnload) {}
+
         var rawStr = String(payload);
         var CHUNK_SIZE = 600;
         var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
