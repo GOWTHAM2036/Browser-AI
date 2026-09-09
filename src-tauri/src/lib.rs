@@ -176,11 +176,39 @@ async fn create_tab_webview(
     let webview_label_page_load = webview_label.clone();
     let chunk_assembler = IpcChunkAssembler::new();
 
+    let suppress_beforeunload_js = r#"
+        (function() {
+            try {
+                var origAEL = EventTarget.prototype.addEventListener;
+                EventTarget.prototype.addEventListener = function(type, listener, options) {
+                    if (type === 'beforeunload') return;
+                    return origAEL.apply(this, arguments);
+                };
+                window.onbeforeunload = null;
+                document.onbeforeunload = null;
+                try {
+                    Object.defineProperty(window, 'onbeforeunload', {
+                        get: function() { return null; },
+                        set: function() {},
+                        configurable: true
+                    });
+                } catch(e) {}
+                window.addEventListener('beforeunload', function(e) {
+                    e.stopImmediatePropagation();
+                    e.stopPropagation();
+                    delete e.returnValue;
+                    e.returnValue = undefined;
+                }, true);
+            } catch(e) {}
+        })();
+    "#;
+
     let webview_builder = WebviewBuilder::new(
         &webview_label,
         WebviewUrl::External(parsed_url)
     )
     .data_directory(data_dir)
+    .initialization_script_for_all_frames(suppress_beforeunload_js)
     .on_navigation(move |url| {
         let is_ipc = url.scheme() == "tauri-ipc-bridge" || 
             ((url.scheme() == "https" || url.scheme() == "http") && url.host_str() == Some("tauri-ipc-bridge"));

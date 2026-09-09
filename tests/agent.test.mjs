@@ -106,6 +106,8 @@ test('observationScript uses safe chunked IPC transport', async () => {
 test('quizExtractScript uses reliable tauri-ipc-bridge transport and valid DOM selectors', async () => {
   const { quizExtractScript } = await loadQuizSolver();
   assert.ok(quizExtractScript.includes('https://tauri-ipc-bridge/data'));
+  assert.ok(quizExtractScript.includes('https://tauri-ipc-bridge/chunk'));
+  assert.ok(quizExtractScript.includes('CHUNK_SIZE'));
   assert.ok(quizExtractScript.includes('QUIZ_SNAPSHOT:'));
   assert.ok(quizExtractScript.includes('location.href'));
   assert.ok(!quizExtractScript.includes('aria-ipc.localhost'), 'Should not use broken aria-ipc.localhost fetch');
