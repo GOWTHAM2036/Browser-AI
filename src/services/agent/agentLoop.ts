@@ -1,6 +1,6 @@
 import { listen, Event as TauriEvent } from '@tauri-apps/api/event';
 import { invoke } from '@tauri-apps/api/core';
-import { AgentObservation, observationScript, ElementRect } from './observer';
+import { AgentObservation, observationScript, ElementRect, createMinimalObservation } from './observer';
 import { AgentAction, validateAgentAction } from './actions';
 import { executionScript, ActionResult } from './executor';
 import { getInPageStatusScript, getInPageCleanupScript } from './inPageOverlay';
@@ -87,43 +87,159 @@ export function getActionSignature(action: AgentAction): string {
   }
 }
 
-export async function observePageDOM(tabId: string): Promise<AgentObservation> {
+export async function observePageDOM(
+  tabId: string,
+  fallbackTab?: { url?: string; title?: string }
+): Promise<AgentObservation> {
   return new Promise(async (resolve, reject) => {
     const eventName = `page-content-tab-${tabId}`;
     let unlisten: (() => void) | null = null;
+    let settled = false;
     console.log(`[OBSERVE-START] tabId=${tabId} event=${eventName}`);
 
-    const timeout = setTimeout(() => {
-      if (unlisten) unlisten();
-      console.log(`[OBSERVE-TIMEOUT] tabId=${tabId}`);
-      reject(new Error('Page observation timed out after 10 seconds'));
-    }, 10000);
-
-    unlisten = await listen<string>(eventName, (event: TauriEvent<string>) => {
-      console.log(`[OBSERVE-EVENT-RECEIVED] event=${eventName} payloadLen=${event.payload.length}`);
-      if (event.payload.startsWith('ARIA_AGENT_OBSERVATION:')) {
-        clearTimeout(timeout);
-        if (unlisten) unlisten();
-        try {
-          const data = JSON.parse(event.payload.substring('ARIA_AGENT_OBSERVATION:'.length));
-          console.log(`[OBSERVE-RESOLVED] tabId=${tabId} elementCount=${data.elements ? data.elements.length : 0}`);
-          resolve(data);
-        } catch (e) {
-          reject(e);
-        }
-      } else if (event.payload.startsWith('ARIA_AGENT_OBSERVATION_ERROR:')) {
-        clearTimeout(timeout);
-        if (unlisten) unlisten();
-        reject(new Error(event.payload.substring('ARIA_AGENT_OBSERVATION_ERROR:'.length)));
+    const cleanup = () => {
+      clearTimeout(timeout);
+      clearTimeout(pollTimer1);
+      clearTimeout(pollTimer2);
+      clearTimeout(pollTimer3);
+      if (unlisten) {
+        unlisten();
+        unlisten = null;
       }
-    });
+    };
+
+    const safeResolve = (data: AgentObservation) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve(data);
+    };
+
+    const safeReject = (err: any) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      if (fallbackTab) {
+        console.warn(`[OBSERVE-FALLBACK-RESOLVE] tabId=${tabId} using fallbackTab metadata: ${fallbackTab.url}`);
+        resolve(createMinimalObservation(fallbackTab.url, fallbackTab.title, `Page observation fallback: ${err?.message || err}`));
+      } else {
+        reject(err);
+      }
+    };
+
+    // Overall observation timeout: 9000ms
+    const timeout = setTimeout(() => {
+      console.log(`[OBSERVE-TIMEOUT] tabId=${tabId}`);
+      safeReject(new Error('Page observation timed out after 9 seconds'));
+    }, 9000);
+
+    // Fallback 1 (800ms): Poll window.__ARIA_AGENT_OBSERVATION__ in webview
+    const pollTimer1 = setTimeout(async () => {
+      if (settled) return;
+      try {
+        const pollJs = `
+          (function() {
+            try {
+              var s = window.__ARIA_AGENT_OBSERVATION__;
+              if (s) {
+                var rawStr = 'ARIA_AGENT_OBSERVATION:' + JSON.stringify(s);
+                var CHUNK_SIZE = 600;
+                var total = Math.ceil(rawStr.length / CHUNK_SIZE) || 1;
+                var msgId = 'obs_poll_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now().toString(36);
+                if (total === 1 && encodeURIComponent(rawStr).length < 1500) {
+                  location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
+                  return;
+                }
+                for (var i = 0; i < total; i++) {
+                  (function(idx) {
+                    setTimeout(function() {
+                      var slice = rawStr.substring(idx * CHUNK_SIZE, (idx + 1) * CHUNK_SIZE);
+                      var chunkUrl = 'https://tauri-ipc-bridge/chunk?id=' + encodeURIComponent(msgId) +
+                                     '&index=' + idx +
+                                     '&total=' + total +
+                                     '&data=' + encodeURIComponent(slice);
+                      location.href = chunkUrl;
+                    }, idx * 25);
+                  })(i);
+                }
+              }
+            } catch(e) {}
+          })();
+        `;
+        await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: pollJs });
+      } catch (e) {}
+    }, 800);
+
+    // Fallback 2 (2200ms): Re-inject primary observationScript
+    const pollTimer2 = setTimeout(async () => {
+      if (settled) return;
+      try {
+        console.log(`[OBSERVE-REINJECT] tabId=${tabId} attempt=2`);
+        await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: observationScript });
+      } catch (e) {}
+    }, 2200);
+
+    // Fallback 3 (4500ms): Lightweight Emergency DOM extraction script
+    const pollTimer3 = setTimeout(async () => {
+      if (settled) return;
+      try {
+        console.log(`[OBSERVE-EMERGENCY-EVAL] tabId=${tabId}`);
+        const emergencyJs = `
+          (function() {
+            try {
+              var btns = Array.from(document.querySelectorAll('button, a, input, textarea, select, [role="button"]')).slice(0, 40);
+              var els = btns.map(function(b, idx) {
+                var id = 'e' + (idx + 1);
+                b.setAttribute('aria-agent-id', id);
+                var r = b.getBoundingClientRect();
+                return {
+                  id: id,
+                  tag: b.tagName.toLowerCase(),
+                  role: b.getAttribute('role') || b.tagName.toLowerCase(),
+                  text: (b.innerText || b.value || b.textContent || '').trim().slice(0, 80),
+                  name: (b.getAttribute('aria-label') || b.innerText || b.value || '').trim().slice(0, 80),
+                  visible: true,
+                  enabled: !b.disabled,
+                  rect: { x: Math.round(r.left), y: Math.round(r.top), width: Math.round(r.width), height: Math.round(r.height) }
+                };
+              });
+              var snap = {
+                url: location.href,
+                title: document.title || 'Untitled',
+                text: (document.body && (document.body.innerText || document.body.textContent) || '').trim().slice(0, 2000),
+                elements: els
+              };
+              try { window.__ARIA_AGENT_OBSERVATION__ = snap; } catch(e) {}
+              var rawStr = 'ARIA_AGENT_OBSERVATION:' + JSON.stringify(snap);
+              location.href = 'https://tauri-ipc-bridge/data?payload=' + encodeURIComponent(rawStr);
+            } catch(e) {}
+          })();
+        `;
+        await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: emergencyJs });
+      } catch (e) {}
+    }, 4500);
 
     try {
+      unlisten = await listen<string>(eventName, (event: TauriEvent<string>) => {
+        const payload = String(event.payload || '');
+        console.log(`[OBSERVE-EVENT-RECEIVED] event=${eventName} payloadLen=${payload.length}`);
+        if (payload.startsWith('ARIA_AGENT_OBSERVATION:')) {
+          try {
+            const data = JSON.parse(payload.substring('ARIA_AGENT_OBSERVATION:'.length));
+            console.log(`[OBSERVE-RESOLVED] tabId=${tabId} elementCount=${data.elements ? data.elements.length : 0}`);
+            safeResolve(data);
+          } catch (e) {
+            safeReject(e);
+          }
+        } else if (payload.startsWith('ARIA_AGENT_OBSERVATION_ERROR:')) {
+          console.warn(`[OBSERVE-ERROR-EVENT] tabId=${tabId} ${payload}`);
+          safeReject(new Error(payload.substring('ARIA_AGENT_OBSERVATION_ERROR:'.length)));
+        }
+      });
+
       await invoke('eval_tab_webview', { webviewLabel: `tab-${tabId}`, js: observationScript });
     } catch (e) {
-      clearTimeout(timeout);
-      if (unlisten) unlisten();
-      reject(e);
+      safeReject(e);
     }
   });
 }
@@ -452,16 +568,36 @@ export async function runAgentLoop(
         });
       } catch (e) {}
 
-      // 1. OBSERVE CURRENT PAGE
+      // 1. OBSERVE CURRENT PAGE (with multi-attempt retries and graceful fallback)
       let currentObservation: AgentObservation;
-      try {
-        currentObservation = await observePageDOM(controlledTabId);
-      } catch (err: any) {
-        const errMsg = `Page observation failed: ${err.message || String(err)}`;
-        log(`[AGENT OBSERVATION ERROR] run=${runId} step=${currentStep} ${errMsg}`);
-        callbacks.onStatusUpdate(errMsg, currentStep);
-        callbacks.onFinish(errMsg, false);
-        return;
+      let observeAttempts = 0;
+      const maxObserveAttempts = 3;
+
+      while (true) {
+        observeAttempts++;
+        const currentTabs = callbacks.getTabs ? callbacks.getTabs() : [];
+        const activeTabInfo = currentTabs.find(t => t.id === controlledTabId);
+
+        try {
+          currentObservation = await observePageDOM(
+            controlledTabId,
+            activeTabInfo ? { url: activeTabInfo.url, title: activeTabInfo.title } : undefined
+          );
+          break;
+        } catch (err: any) {
+          const errMsg = `Page observation note: ${err?.message || String(err)}`;
+          log(`[AGENT OBSERVATION RETRY] run=${runId} step=${currentStep} attempt=${observeAttempts}/${maxObserveAttempts} ${errMsg}`);
+          if (observeAttempts >= maxObserveAttempts) {
+            currentObservation = createMinimalObservation(
+              activeTabInfo?.url || '',
+              activeTabInfo?.title || 'Untitled',
+              `Page observation timed out after ${maxObserveAttempts} attempts. The page may still be loading or navigating.`
+            );
+            break;
+          }
+          callbacks.onStatusUpdate(`Waiting for page to respond (Retry ${observeAttempts}/${maxObserveAttempts})...`, currentStep);
+          await sleep(1000 * observeAttempts);
+        }
       }
 
       const currentObservationHash = getObservationHash(currentObservation);
@@ -943,7 +1079,10 @@ ${previousActionResult}`;
       await waitForPageSettled(controlledTabId, { timeoutMs: 120 });
       let postObservation: AgentObservation;
       try {
-        postObservation = await observePageDOM(controlledTabId);
+        postObservation = await observePageDOM(controlledTabId, {
+          url: currentObservation.url,
+          title: currentObservation.title
+        });
       } catch (e) {
         postObservation = currentObservation;
       }

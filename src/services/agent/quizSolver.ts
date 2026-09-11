@@ -523,7 +523,16 @@ export async function observeQuizPage(tabId: string): Promise<QuizQuestionData> 
       if (settled) return;
       settled = true;
       cleanup();
-      reject(new Error('Quiz observation timed out after 10s'));
+      console.warn(`[QUIZ-OBSERVE-TIMEOUT] tabId=${tabId}, returning safe fallback question data`);
+      resolve({
+        isCompleted: false,
+        questionText: '',
+        options: [],
+        scoreText: '',
+        progressText: '',
+        hasSubmit: false,
+        hasNext: false
+      });
     }, 10000);
 
     // Fallback 1 (800ms): Poll window.__QUIZ_SNAPSHOT__ with chunked IPC
@@ -1066,19 +1075,38 @@ export async function runAutoQuizSolver(
 
     callbacks.onStatusUpdate(`Analyzing Question ${currentQuestionNum || 1}...`, currentQuestionNum || 1);
 
-    // 1. Observe current page
-    let questionState: QuizQuestionData;
-    try {
-      questionState = await observeQuizPage(tabId);
-    } catch (err: any) {
-      callbacks.onLog(`[QUIZ_SOLVER] Observation note: ${err?.message || err}. Retrying...`);
-      await new Promise(r => setTimeout(r, 1000));
+    // 1. Observe current page with progressive retries
+    let questionState: QuizQuestionData | null = null;
+    let observeAttempts = 0;
+    const maxObserveAttempts = 4;
+
+    while (observeAttempts < maxObserveAttempts) {
+      observeAttempts++;
       try {
         questionState = await observeQuizPage(tabId);
-      } catch (err2) {
-        callbacks.onFinish('Failed to read quiz page DOM.', false);
-        return;
+        if (questionState && (questionState.options.length > 0 || questionState.isCompleted || questionState.hasNext || questionState.hasSubmit)) {
+          break;
+        }
+      } catch (err: any) {
+        callbacks.onLog(`[QUIZ_SOLVER] Observation note (attempt ${observeAttempts}/${maxObserveAttempts}): ${err?.message || err}`);
       }
+
+      if (observeAttempts < maxObserveAttempts) {
+        callbacks.onLog(`[QUIZ_SOLVER] Waiting for page DOM to settle (Retry ${observeAttempts}/${maxObserveAttempts})...`);
+        await new Promise(r => setTimeout(r, 1000 * observeAttempts));
+      }
+    }
+
+    if (!questionState) {
+      questionState = {
+        isCompleted: false,
+        questionText: '',
+        options: [],
+        scoreText: '',
+        progressText: '',
+        hasSubmit: false,
+        hasNext: false
+      };
     }
 
     // 2. Check if test is completed
