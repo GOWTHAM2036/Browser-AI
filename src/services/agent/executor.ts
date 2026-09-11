@@ -92,29 +92,64 @@ export function buildExecutionScript(
       sendIpc('ARIA_AGENT_RESULT:' + payloadStr);
     };
 
-    // 1. Resolve Target Element
-    var el = null;
-    if (elementId) {
-      el = document.querySelector('[aria-agent-id="' + elementId + '"]');
+    // --- Helper to collect all frame documents ---
+    function getAllDocs() {
+      var docs = [document];
+      try {
+        var iframes = document.querySelectorAll('iframe, frame');
+        for (var f = 0; f < iframes.length; f++) {
+          try {
+            var fDoc = iframes[f].contentDocument || (iframes[f].contentWindow && iframes[f].contentWindow.document);
+            if (fDoc && docs.indexOf(fDoc) === -1) docs.push(fDoc);
+          } catch(e) {}
+        }
+      } catch(e) {}
+      return docs;
     }
 
-    // Fallback 1: Geometric Center Point Query
+    var allDocs = getAllDocs();
+
+    // 1. Resolve Target Element across main document and iframes
+    var el = null;
+    if (elementId) {
+      for (var d1 = 0; d1 < allDocs.length && !el; d1++) {
+        try {
+          el = allDocs[d1].querySelector('[aria-agent-id="' + elementId + '"]');
+        } catch(e) {}
+      }
+    }
+
+    // Fallback 1: Geometric Center Point Query with iframe penetration
     if (!el && targetRect && typeof targetRect.x === 'number' && typeof targetRect.y === 'number') {
       var cx = Math.round(targetRect.x + (targetRect.width || 0) / 2);
       var cy = Math.round(targetRect.y + (targetRect.height || 0) / 2);
       if (cx >= 0 && cy >= 0 && cx <= window.innerWidth && cy <= window.innerHeight) {
         el = document.elementFromPoint(cx, cy);
+        if (el && (el.tagName === 'IFRAME' || el.tagName === 'FRAME')) {
+          try {
+            var innerDoc = el.contentDocument || (el.contentWindow && el.contentWindow.document);
+            if (innerDoc) {
+              var iframeRect = el.getBoundingClientRect();
+              var innerEl = innerDoc.elementFromPoint(cx - iframeRect.left, cy - iframeRect.top);
+              if (innerEl) el = innerEl;
+            }
+          } catch(eFrame) {}
+        }
       }
     }
 
-    // Fallback 2: Candidate search by element_id attribute
+    // Fallback 2: Candidate search by element_id attribute across all documents
     if (!el && elementId) {
-      var candidates = document.querySelectorAll('button, a, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="searchbox"]');
-      for (var i = 0; i < candidates.length; i++) {
-        if (candidates[i].getAttribute('aria-agent-id') === elementId) {
-          el = candidates[i];
-          break;
-        }
+      for (var d2 = 0; d2 < allDocs.length && !el; d2++) {
+        try {
+          var candidates = allDocs[d2].querySelectorAll('button, a, input, textarea, select, [role="button"], [role="link"], [role="textbox"], [role="searchbox"]');
+          for (var i = 0; i < candidates.length; i++) {
+            if (candidates[i].getAttribute('aria-agent-id') === elementId) {
+              el = candidates[i];
+              break;
+            }
+          }
+        } catch(eCand) {}
       }
     }
 

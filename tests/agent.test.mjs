@@ -179,6 +179,34 @@ test('large DOM observation (100+ elements, 60KB) is chunked below URL limits an
   assert.equal(parsedObs.elements[2].checked, true);
 });
 
+test('createMinimalObservation generates safe fallback observation', async () => {
+  const { createMinimalObservation } = await loadAgentObserver();
+  const obs = createMinimalObservation('https://example.com', 'Example Page', 'Custom timeout note');
+  assert.equal(obs.url, 'https://example.com');
+  assert.equal(obs.title, 'Example Page');
+  assert.equal(obs.text, 'Custom timeout note');
+  assert.deepEqual(obs.elements, []);
+
+  const defaultObs = createMinimalObservation();
+  assert.equal(defaultObs.url, '');
+  assert.equal(defaultObs.title, 'Untitled');
+  assert.ok(defaultObs.text.includes('fallback'));
+});
+
+test('observationScript includes iframe traversal, snapshot caching, and resilient fallbacks', async () => {
+  const { observationScript } = await loadAgentObserver();
+  assert.ok(observationScript.includes('getAllDocs'), 'Should include iframe traversal via getAllDocs');
+  assert.ok(observationScript.includes('window.__ARIA_AGENT_OBSERVATION__'), 'Should cache snapshot in window');
+  assert.ok(observationScript.includes('[OBSERVE-ERROR-FALLBACK]'), 'Should log fallback on extraction errors');
+});
+
+test('executor includes multi-frame support for element resolution', async () => {
+  const { buildExecutionScript } = await loadAgentExecutor();
+  const script = buildExecutionScript({ action: 'click', element_id: 'e1' });
+  assert.ok(script.includes('getAllDocs'), 'Executor should collect all frame documents');
+  assert.ok(script.includes('IFRAME'), 'Executor should penetrate iframes during coordinate queries');
+});
+
 async function loadAgentUtils() {
   await rm(outDir, { recursive: true, force: true });
   await mkdir(outDir, { recursive: true });
@@ -210,6 +238,22 @@ async function loadAgentActions() {
     external: ['@tauri-apps/api/core', '@tauri-apps/api/event']
   });
   return import(pathToFileURL(join(outDir, 'actions.js')).href + '?cache=' + Date.now());
+}
+
+async function loadAgentExecutor() {
+  await rm(outDir, { recursive: true, force: true });
+  await mkdir(outDir, { recursive: true });
+  await esbuild.build({
+    entryPoints: [
+      join(repoRoot, 'src/services/agent/executor.ts')
+    ],
+    outfile: join(outDir, 'executor.js'),
+    bundle: true,
+    format: 'esm',
+    platform: 'browser',
+    external: ['@tauri-apps/api/core', '@tauri-apps/api/event']
+  });
+  return import(pathToFileURL(join(outDir, 'executor.js')).href + '?cache=' + Date.now());
 }
 
 async function loadAgentLoop() {

@@ -89,7 +89,26 @@ export const ReaderMode: React.FC = () => {
             siteName: parsed.siteName || undefined
           });
         } else {
-          setError('Failed to extract readable article content.');
+          // Fallback: extract title and cleaned body content directly
+          const fallbackTitle = doc.title || 'Untitled Document';
+          const bodyEl = doc.body;
+          if (bodyEl) {
+            bodyEl.querySelectorAll('script, style, noscript, nav, header, footer').forEach(n => n.remove());
+            const fallbackContent = bodyEl.innerHTML || '';
+            const fallbackText = (bodyEl.innerText || bodyEl.textContent || '').trim();
+            if (fallbackText.length > 50) {
+              setArticle({
+                title: fallbackTitle,
+                content: fallbackContent,
+                textContent: fallbackText,
+                excerpt: fallbackText.slice(0, 200) + '...'
+              });
+            } else {
+              setError('Failed to extract readable article content.');
+            }
+          } else {
+            setError('Failed to extract readable article content.');
+          }
         }
       } catch (e: any) {
         setError(`Error parsing page: ${e.message}`);
