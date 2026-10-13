@@ -3,12 +3,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { AgentObservation, observationScript, ElementRect, createMinimalObservation } from './observer';
 import { AgentAction, validateAgentAction } from './actions';
 import { executionScript, ActionResult } from './executor';
-import { getInPageStatusScript, getInPageCleanupScript } from './inPageOverlay';
+import { getInPageStatusScript, getInPageCleanupScript, getInPageInteractionBlockerScript } from './inPageOverlay';
 import { getActiveProvider, getApiKey } from '../ai';
 import { normalizeAgentUrl } from '../agent';
 import { extractJsonFromText } from '../utils';
 import { BrowserSettings, Tab } from '../../types';
 import { emitAgentVisualEvent, completeAgentVisualAction, hideAgentCursor } from './visualEvents';
+import { globalAgentStateMachine, isConsequentialAction } from './executionStateMachine';
 
 export interface AgentLoopCallbacks {
   onStatusUpdate: (status: string, currentStep: number) => void;
@@ -35,10 +36,40 @@ export interface AgentLoopCallbacks {
 let activeGlobalRunId: string | null = null;
 let activeControlledTabId: string | null = null;
 
+export async function lockWebviewInteraction(tabId: string): Promise<void> {
+  const webviewLabel = `tab-${tabId}`;
+  try {
+    await invoke('set_tab_interaction_lock', { webviewLabel, locked: true });
+  } catch (e) {
+    try {
+      await invoke('eval_tab_webview', {
+        webviewLabel,
+        js: getInPageInteractionBlockerScript(true)
+      });
+    } catch (err) {}
+  }
+}
+
+export async function releaseWebviewInteractionLock(tabId: string): Promise<void> {
+  const webviewLabel = `tab-${tabId}`;
+  try {
+    await invoke('set_tab_interaction_lock', { webviewLabel, locked: false });
+  } catch (e) {
+    try {
+      await invoke('eval_tab_webview', {
+        webviewLabel,
+        js: getInPageInteractionBlockerScript(false)
+      });
+    } catch (err) {}
+  }
+}
+
 export function cancelActiveAgentRun(): void {
   activeGlobalRunId = null;
+  globalAgentStateMachine.requestStop();
   hideAgentCursor();
   if (activeControlledTabId) {
+    releaseWebviewInteractionLock(activeControlledTabId).catch(() => {});
     invoke('eval_tab_webview', {
       webviewLabel: `tab-${activeControlledTabId}`,
       js: getInPageCleanupScript()
@@ -512,8 +543,19 @@ export async function runAgentLoop(
   callbacks: AgentLoopCallbacks
 ): Promise<void> {
   const runId = 'run-' + Math.random().toString(36).substring(2, 9);
+
+  // Centralized state machine start check (prevents duplicate runs)
+  if (!globalAgentStateMachine.startRun(runId, '', initialTabId, goal)) {
+    console.warn(`[AGENT TRACE] Duplicate run rejected: another agent execution is currently active or stopping.`);
+    callbacks.onFinish('Duplicate run prevented: an agent run is already active', false);
+    return;
+  }
+
   activeGlobalRunId = runId;
   activeControlledTabId = initialTabId;
+
+  // Lock user interaction on active webview while agent is running
+  await lockWebviewInteraction(initialTabId);
 
   let currentStep = 0;
   const maxSteps = 100;
@@ -525,6 +567,7 @@ export async function runAgentLoop(
   let failCount = 0;
   let lastFailedKey: string | null = null;
   let fastPathApplied = false;
+  let wasJustResumed = false;
 
   const actionHistory: {
     step: number;
@@ -543,18 +586,49 @@ export async function runAgentLoop(
 
   try {
     while (currentStep < maxSteps) {
-      if (activeGlobalRunId !== runId || callbacks.isCancelled()) {
+      if (activeGlobalRunId !== runId || globalAgentStateMachine.isAborted() || callbacks.isCancelled()) {
         log(`[AGENT] run=${runId} Cancelled or superseded.`);
         callbacks.onFinish('Aborted', false);
         return;
       }
 
-      while (callbacks.isPaused()) {
-        if (activeGlobalRunId !== runId || callbacks.isCancelled()) {
-          callbacks.onFinish('Aborted', false);
+      // Safe pause handling: pause execution before starting any new action
+      if (globalAgentStateMachine.isPaused() || globalAgentStateMachine.isPausing() || callbacks.isPaused()) {
+        hideAgentCursor();
+        globalAgentStateMachine.confirmPaused();
+        callbacks.onStatusUpdate('Agent Paused (Browser is interactive)', currentStep);
+
+        // Release webview interaction lock during pause so user can control page normally
+        await releaseWebviewInteractionLock(controlledTabId);
+
+        try {
+          await invoke('eval_tab_webview', {
+            webviewLabel: `tab-${controlledTabId}`,
+            js: getInPageStatusScript('Paused · Browser is interactive', currentStep, 'paused')
+          });
+        } catch (e) {}
+
+        const resumed = await globalAgentStateMachine.waitForResume(globalAgentStateMachine.getSignal());
+        if (!resumed || activeGlobalRunId !== runId || globalAgentStateMachine.isAborted() || callbacks.isCancelled()) {
+          log(`[AGENT] run=${runId} Stopped while paused.`);
+          callbacks.onFinish('Aborted by user', false);
           return;
         }
-        await sleep(200);
+
+        log(`[AGENT RESUME] run=${runId} Resumed. Re-locking interaction and re-evaluating current page DOM fresh.`);
+        // Re-engage webview interaction lock immediately upon resuming
+        await lockWebviewInteraction(controlledTabId);
+
+        callbacks.onStatusUpdate('Resumed: re-observing page state...', currentStep);
+        wasJustResumed = true;
+      }
+
+      // Safe resume semantics: discard stale observations and plans, take fresh snapshot
+      if (wasJustResumed) {
+        previousObservation = null;
+        previousObservationHash = null;
+        previousActionResult = 'Resumed by user: re-evaluating page state.';
+        wasJustResumed = false;
       }
 
       currentStep++;
@@ -654,6 +728,7 @@ export async function runAgentLoop(
               url: targetFastUrl
             });
             await waitForPageSettled(controlledTabId, { expectedUrl: targetFastUrl, timeoutMs: 1200 });
+            await lockWebviewInteraction(controlledTabId);
             previousActionResult = `Success: Navigated to ${targetFastUrl}.`;
             actionHistory.push({
               step: currentStep,
@@ -838,6 +913,41 @@ ${previousActionResult}`;
       const targetEl = targetElementId ? currentObservation.elements.find((e) => e.id === targetElementId) : undefined;
       const targetName = targetEl?.name || targetEl?.text?.slice(0, 30) || targetEl?.placeholder || (targetElementId || ('url' in action ? action.url : ''));
 
+      // Check if page URL changed or user navigated away in browser
+      const currentTabs = callbacks.getTabs ? callbacks.getTabs() : [];
+      const currentTab = currentTabs.find(t => t.id === controlledTabId);
+      if (currentTab?.url && currentObservation.url) {
+        try {
+          const curUrl = new URL(currentTab.url);
+          const obsUrl = new URL(currentObservation.url);
+          if (curUrl.origin !== obsUrl.origin || (curUrl.pathname !== obsUrl.pathname && Math.abs(curUrl.pathname.length - obsUrl.pathname.length) > 1)) {
+            log(`[AGENT CONFLICT DETECTED] Page URL changed from ${currentObservation.url} to ${currentTab.url} (user navigated). Invalidating plan and re-observing.`);
+            callbacks.onStatusUpdate('User navigation detected: refreshing page snapshot...', currentStep);
+            previousActionResult = `Page URL changed to ${currentTab.url}. Re-evaluating current page.`;
+            continue;
+          }
+        } catch (e) {}
+      }
+
+      // Check for consequential, financial, or destructive action
+      const consequentialCheck = isConsequentialAction(action, targetName);
+      if (consequentialCheck.isConsequential) {
+        log(`[AGENT CONSEQUENTIAL ACTION] ${consequentialCheck.reason}`);
+        callbacks.onStatusUpdate(`Awaiting confirmation for ${action.action}...`, currentStep);
+        globalAgentStateMachine.setPendingAction(`Confirm ${action.action} on "${targetName}"`);
+        const confirmed = await globalAgentStateMachine.requestUserConfirmation(
+          `Do you want the agent to proceed with ${action.action.toUpperCase()} on "${targetName}"? (${consequentialCheck.reason})`
+        );
+        if (!confirmed || activeGlobalRunId !== runId || globalAgentStateMachine.isAborted()) {
+          log(`[AGENT USER DECLINED] Consequential action ${actionSig} cancelled.`);
+          previousActionResult = `User declined consequential action ${actionSig}. Please choose another action.`;
+          callbacks.onStatusUpdate('Action cancelled by user', currentStep);
+          continue;
+        }
+      }
+
+      globalAgentStateMachine.setPendingAction(`Step ${currentStep}: ${action.action} on ${targetName}`);
+
       // 4. LOOP & IDENTICAL REPEATED ACTION GUARD
       const lastExecutedAction = actionHistory.length > 0 ? actionHistory[actionHistory.length - 1] : null;
       if (lastExecutedAction && lastExecutedAction.signature === actionSig && previousObservationHash === currentObservationHash) {
@@ -1010,6 +1120,7 @@ ${previousActionResult}`;
             });
           }
           await waitForPageSettled(controlledTabId, { expectedUrl: formattedUrl, timeoutMs: 1200 });
+          await lockWebviewInteraction(controlledTabId);
           execResult = { success: true, action: 'navigate' };
           executedTypeWithoutSubmit = false;
         } catch (err: any) {
@@ -1027,6 +1138,7 @@ ${previousActionResult}`;
             controlledTabId = targetTabId;
             activeControlledTabId = targetTabId;
             await waitForPageSettled(controlledTabId, { timeoutMs: 400 });
+            await lockWebviewInteraction(controlledTabId);
             execResult = { success: true, action: 'activate_tab' };
           } else {
             execResult = { success: false, action: 'activate_tab', error: 'Target tab not found' };
@@ -1051,6 +1163,7 @@ ${previousActionResult}`;
               url: destUrl
             });
             await waitForPageSettled(controlledTabId, { expectedUrl: destUrl, timeoutMs: 1200 });
+            await lockWebviewInteraction(controlledTabId);
           } catch (e) {}
         } else {
           await waitForPageSettled(controlledTabId, { timeoutMs: 300 });
@@ -1100,6 +1213,22 @@ ${previousActionResult}`;
         result: execResult.success ? 'success' : 'error',
         verification: verification.message
       });
+
+      if (execResult.stale) {
+        log(`[AGENT STALE DETECTED] Element '${targetElementId}' was invalidated due to page changes. Discarding stale plan and re-observing.`);
+        completeAgentVisualAction({ success: false, error: 'Element shifted or changed' });
+        previousActionResult = `Element '${targetElementId}' changed or moved due to user interaction or page re-render. Re-evaluating page.`;
+        callbacks.onStatusUpdate('Page changed: refreshing elements...', currentStep);
+        callbacks.onTimelineUpdate({
+          id: timelineId,
+          timestamp: new Date().toLocaleTimeString(),
+          actionType: action.action,
+          target: actionTarget,
+          result: 'Invalidated by page change',
+          status: 'error'
+        });
+        continue;
+      }
 
       if (execResult.success && verification.verified) {
         completeAgentVisualAction({ success: true });
@@ -1155,8 +1284,10 @@ ${previousActionResult}`;
     if (activeGlobalRunId === runId) {
       activeGlobalRunId = null;
     }
+    globalAgentStateMachine.confirmStopped();
     hideAgentCursor();
     if (controlledTabId) {
+      await releaseWebviewInteractionLock(controlledTabId).catch(() => {});
       invoke('eval_tab_webview', {
         webviewLabel: `tab-${controlledTabId}`,
         js: getInPageCleanupScript()

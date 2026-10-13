@@ -3,6 +3,8 @@ import { listen } from '@tauri-apps/api/event';
 import { getActiveProvider } from '../ai';
 import { BrowserSettings } from '../../types';
 import { observationScript } from './observer';
+import { globalAgentStateMachine } from './executionStateMachine';
+import { lockWebviewInteraction, releaseWebviewInteractionLock } from './agentLoop';
 
 export interface QuizQuestionData {
   questionText: string;
@@ -35,6 +37,7 @@ let activeQuizRunId: string | null = null;
 
 export function cancelActiveQuizRun(): void {
   activeQuizRunId = null;
+  globalAgentStateMachine.requestStop();
 }
 
 /** DOM extraction script to identify questions, options, images, and progress across main document & iframes */
@@ -1015,6 +1018,16 @@ export async function runAutoQuizSolver(
   const runId = 'quiz_run_' + Date.now();
   activeQuizRunId = runId;
 
+  // Centralized state machine start check (prevents duplicate runs)
+  if (!globalAgentStateMachine.startRun(runId, '', tabId, 'Auto Solve Assessment')) {
+    callbacks.onLog('[QUIZ_SOLVER] Run prevented: another agent run is active or stopping.');
+    callbacks.onFinish('Duplicate run prevented', false);
+    return;
+  }
+
+  // Lock user interaction on active webview while quiz solver is running
+  await lockWebviewInteraction(tabId);
+
   callbacks.onLog('[QUIZ_SOLVER] Starting Automated Assessment Solver...');
   callbacks.onStatusUpdate('Initializing Assessment Auto-Solver...', 0);
 
@@ -1039,7 +1052,7 @@ export async function runAutoQuizSolver(
                 set: function() {},
                 configurable: true
               });
-            } catch(e) {}
+            } catch(e0) {}
             window.addEventListener('beforeunload', function(e) {
               e.stopImmediatePropagation();
               e.stopPropagation();
@@ -1058,22 +1071,35 @@ export async function runAutoQuizSolver(
   let lastQuestionText = '';
   let sameQuestionRepeatCount = 0;
 
-  while (loopIterations < maxIterations) {
-    loopIterations++;
+  try {
+    while (loopIterations < maxIterations) {
+      loopIterations++;
 
-    if (activeQuizRunId !== runId || callbacks.isCancelled()) {
-      callbacks.onLog('[QUIZ_SOLVER] Solver was stopped by user.');
-      callbacks.onFinish('Quiz solver stopped.', false);
-      return;
-    }
+      if (activeQuizRunId !== runId || callbacks.isCancelled() || globalAgentStateMachine.isAborted()) {
+        callbacks.onLog('[QUIZ_SOLVER] Solver was stopped by user.');
+        callbacks.onFinish('Quiz solver stopped.', false);
+        return;
+      }
 
-    while (callbacks.isPaused()) {
-      callbacks.onStatusUpdate('Solver Paused', currentQuestionNum);
-      await new Promise(r => setTimeout(r, 500));
-      if (activeQuizRunId !== runId || callbacks.isCancelled()) return;
-    }
+      if (callbacks.isPaused() || globalAgentStateMachine.isPaused() || globalAgentStateMachine.isPausing()) {
+        globalAgentStateMachine.confirmPaused();
+        callbacks.onStatusUpdate('Solver Paused (Browser is interactive)', currentQuestionNum);
+        // Release webview interaction lock during pause
+        await releaseWebviewInteractionLock(tabId);
 
-    callbacks.onStatusUpdate(`Analyzing Question ${currentQuestionNum || 1}...`, currentQuestionNum || 1);
+        const resumed = await globalAgentStateMachine.waitForResume(globalAgentStateMachine.getSignal());
+        if (!resumed || activeQuizRunId !== runId || callbacks.isCancelled() || globalAgentStateMachine.isAborted()) {
+          callbacks.onLog('[QUIZ_SOLVER] Solver stopped while paused.');
+          callbacks.onFinish('Quiz solver stopped.', false);
+          return;
+        }
+
+        // Re-lock on resume
+        await lockWebviewInteraction(tabId);
+      }
+
+      globalAgentStateMachine.setPendingAction(`Solving Question ${currentQuestionNum || 1}...`);
+      callbacks.onStatusUpdate(`Analyzing Question ${currentQuestionNum || 1}...`, currentQuestionNum || 1);
 
     // 1. Observe current page with progressive retries
     let questionState: QuizQuestionData | null = null;
@@ -1221,5 +1247,12 @@ export async function runAutoQuizSolver(
     await new Promise(r => setTimeout(r, 1400));
   }
 
-  callbacks.onFinish(`Completed assessment session (${currentQuestionNum} questions handled).`, true);
+    callbacks.onFinish(`Completed assessment session (${currentQuestionNum} questions handled).`, true);
+  } finally {
+    if (activeQuizRunId === runId) {
+      activeQuizRunId = null;
+    }
+    await releaseWebviewInteractionLock(tabId).catch(() => {});
+    globalAgentStateMachine.confirmStopped();
+  }
 }

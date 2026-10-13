@@ -3,7 +3,11 @@ import { useBrowserStore } from '../store/browserStore';
 import { Search, Sparkles, History, Bookmark, ArrowRight, X } from 'lucide-react';
 import { normalizeUrl } from '../services/utils';
 
-export const Omnibox: React.FC = () => {
+export interface OmniboxProps {
+  disabled?: boolean;
+}
+
+export const Omnibox: React.FC<OmniboxProps> = ({ disabled = false }) => {
   const {
     tabs,
     activeTabId,
@@ -43,6 +47,7 @@ export const Omnibox: React.FC = () => {
   }, []);
 
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    if (disabled) return;
     setInputValue(e.target.value);
     setShowSuggestions(true);
     setSuggestionIdx(-1);
@@ -57,7 +62,7 @@ export const Omnibox: React.FC = () => {
 
   // Get matching suggestions
   const getSuggestions = () => {
-    if (!inputValue.trim()) return [];
+    if (disabled || !inputValue.trim()) return [];
     
     const query = inputValue.toLowerCase();
     
@@ -79,6 +84,10 @@ export const Omnibox: React.FC = () => {
   const suggestions = getSuggestions();
 
   const handleKeyDown = async (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (disabled) {
+      e.preventDefault();
+      return;
+    }
     if (e.key === 'ArrowDown') {
       e.preventDefault();
       setSuggestionIdx(prev => Math.min(prev + 1, suggestions.length - 1));
@@ -134,9 +143,11 @@ export const Omnibox: React.FC = () => {
   return (
     <div ref={containerRef} className="relative flex-1 min-w-[200px] max-w-2xl mx-2 select-none">
       <div className={`relative flex items-center bg-[#0b0f19] border rounded-lg transition-all duration-200 ${
-        askAiActive 
-          ? 'border-purple-500 ring-2 ring-purple-500/20' 
-          : 'border-slate-700/80 focus-within:border-[#3b82f6] focus-within:ring-2 focus-within:ring-[#3b82f6]/20'
+        disabled
+          ? 'border-slate-800 opacity-60 cursor-not-allowed bg-slate-900/60'
+          : askAiActive 
+            ? 'border-purple-500 ring-2 ring-purple-500/20' 
+            : 'border-slate-700/80 focus-within:border-[#3b82f6] focus-within:ring-2 focus-within:ring-[#3b82f6]/20'
       }`}>
         <div className="pl-2.5 text-slate-400 shrink-0">
           {askAiActive ? (
@@ -149,11 +160,21 @@ export const Omnibox: React.FC = () => {
         <input
           type="text"
           value={inputValue}
+          disabled={disabled}
           onChange={handleInputChange}
           onKeyDown={handleKeyDown}
-          onFocus={() => setShowSuggestions(true)}
-          placeholder={askAiActive ? "Ask AI anything... (Enter to submit)" : "Search or type URL... (Ctrl+Enter to Ask AI)"}
-          className="w-full bg-transparent border-0 py-1 pl-2 pr-14 text-xs text-slate-100 outline-none placeholder-slate-500 font-sans"
+          onFocus={() => { if (!disabled) setShowSuggestions(true); }}
+          placeholder={
+            disabled
+              ? "Address bar locked while agent is running..."
+              : askAiActive
+                ? "Ask AI anything... (Enter to submit)"
+                : "Search or type URL... (Ctrl+Enter to Ask AI)"
+          }
+          title={disabled ? "Address bar locked while agent is running. Pause agent to navigate." : undefined}
+          className={`w-full bg-transparent border-0 py-1 pl-2 pr-14 text-xs text-slate-100 outline-none placeholder-slate-500 font-sans ${
+            disabled ? 'cursor-not-allowed text-slate-400' : ''
+          }`}
         />
 
         {inputValue && (
