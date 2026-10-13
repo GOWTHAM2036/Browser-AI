@@ -9,7 +9,8 @@ import { AgentCursor } from './agent/AgentCursor';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 import { invoke } from '@tauri-apps/api/core';
 import { listen, Event } from '@tauri-apps/api/event';
-import { ArrowLeft, ArrowRight, RotateCw, Home, BookOpen, Sparkles, Settings as SettingsIcon, Minus, Square, X } from 'lucide-react';
+import { ArrowLeft, ArrowRight, RotateCw, Home, BookOpen, Sparkles, Settings as SettingsIcon, Minus, Square, X, Play, Pause, StopCircle, RefreshCw } from 'lucide-react';
+import { useAgentExecutionStore } from '../store/agentExecutionStore';
 
 export const BrowserShell: React.FC = () => {
   const {
@@ -31,6 +32,10 @@ export const BrowserShell: React.FC = () => {
     addHistoryEntry,
     updateTab
   } = useBrowserStore();
+
+  const { executionState, pendingAction, pause, resume, stop } = useAgentExecutionStore();
+  const isAgentActive = ['running', 'pausing', 'paused', 'stopping'].includes(executionState);
+  const isAgentRunning = executionState === 'running' || executionState === 'pausing';
 
   const containerRef = useRef<HTMLDivElement>(null);
   const activeTab = tabs.find(t => t.id === activeTabId);
@@ -124,6 +129,31 @@ export const BrowserShell: React.FC = () => {
       return () => observer.disconnect();
     }
   }, [activeTabId, sidebarOpen, readerModeActive, settingsOpen, settings.sidebarPosition]);
+
+  // Synchronize interaction lock state on active tab when tab or execution state changes
+  useEffect(() => {
+    if (!activeTabId) return;
+    if (isAgentRunning) {
+      invoke('set_tab_interaction_lock', {
+        webviewLabel: `tab-${activeTabId}`,
+        locked: true
+      }).catch(() => {});
+    } else {
+      invoke('set_tab_interaction_lock', {
+        webviewLabel: `tab-${activeTabId}`,
+        locked: false
+      }).catch(() => {});
+    }
+
+    return () => {
+      if (activeTabId && !isAgentRunning) {
+        invoke('set_tab_interaction_lock', {
+          webviewLabel: `tab-${activeTabId}`,
+          locked: false
+        }).catch(() => {});
+      }
+    };
+  }, [activeTabId, isAgentRunning]);
 
   // Listen for navigation updates inside the child webview (via custom page-content event)
   // Listen for navigation updates inside any child webview (via global tab-metadata-update event)
@@ -239,39 +269,136 @@ export const BrowserShell: React.FC = () => {
       <div className="flex items-center px-4 py-1.5 bg-[#1e293b] border-b border-slate-800 gap-1 select-none">
         <button
           onClick={goBackActiveTab}
-          disabled={!activeTab?.canGoBack}
+          disabled={!activeTab?.canGoBack || isAgentRunning}
           className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer"
-          title="Back"
+          title={isAgentRunning ? "Navigation locked while agent is running. Pause agent to navigate." : "Back"}
         >
           <ArrowLeft size={13} />
         </button>
         <button
           onClick={goForwardActiveTab}
-          disabled={!activeTab?.canGoForward}
+          disabled={!activeTab?.canGoForward || isAgentRunning}
           className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer"
-          title="Forward"
+          title={isAgentRunning ? "Navigation locked while agent is running. Pause agent to navigate." : "Forward"}
         >
           <ArrowRight size={13} />
         </button>
         <button
           onClick={reloadActiveTab}
-          className={`p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-all cursor-pointer ${
+          disabled={isAgentRunning}
+          className={`p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer ${
             activeTab?.loading ? 'animate-spin text-[#3b82f6]' : ''
           }`}
-          title="Reload"
+          title={isAgentRunning ? "Navigation locked while agent is running. Pause agent to reload." : "Reload"}
         >
           <RotateCw size={12} />
         </button>
         <button
           onClick={() => updateTab(activeTabId!, { url: settings.homepage })}
-          className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 transition-all cursor-pointer"
-          title="Home"
+          disabled={isAgentRunning}
+          className="p-1.5 rounded-lg hover:bg-slate-700 text-slate-400 hover:text-slate-200 disabled:opacity-40 disabled:hover:bg-transparent disabled:cursor-not-allowed transition-all cursor-pointer"
+          title={isAgentRunning ? "Navigation locked while agent is running. Pause agent to navigate." : "Home"}
         >
           <Home size={13} />
         </button>
 
         {/* Omnibox URL input */}
-        <Omnibox />
+        <Omnibox disabled={isAgentRunning} />
+
+        {/* Persistent Agent Execution Control Pill */}
+        {isAgentActive && (
+          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-xl bg-slate-900 border border-slate-700/80 shadow-md">
+            <div className="flex items-center gap-1.5 pr-1.5 border-r border-slate-800">
+              <span className={`w-2 h-2 rounded-full ${
+                executionState === 'running' ? 'bg-purple-500 animate-ping' :
+                executionState === 'pausing' ? 'bg-amber-500 animate-ping' :
+                executionState === 'paused' ? 'bg-amber-400' :
+                'bg-red-500 animate-pulse'
+              }`} />
+              <span className="text-[10px] font-bold uppercase tracking-wider text-purple-300">
+                {executionState === 'running' ? 'Agent' :
+                 executionState === 'pausing' ? 'Pausing' :
+                 executionState === 'paused' ? 'Paused' :
+                 'Stopping'}
+              </span>
+            </div>
+
+            {/* Pending action status */}
+            {pendingAction && (
+              <span className="text-[10px] text-slate-300 font-mono truncate max-w-[130px]" title={pendingAction}>
+                {pendingAction}
+              </span>
+            )}
+
+            {/* Controls */}
+            <div className="flex items-center gap-1 pl-1">
+              {executionState === 'running' && (
+                <>
+                  <button
+                    onClick={pause}
+                    className="p-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-amber-400 border border-slate-700 transition-all cursor-pointer"
+                    title="Pause Agent Execution"
+                  >
+                    <Pause size={11} fill="currentColor" />
+                  </button>
+                  <button
+                    onClick={stop}
+                    className="p-1 rounded-lg bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
+                    title="Stop Agent Execution"
+                  >
+                    <StopCircle size={11} fill="currentColor" />
+                  </button>
+                </>
+              )}
+
+              {executionState === 'pausing' && (
+                <>
+                  <button
+                    disabled
+                    className="p-1 rounded-lg bg-slate-800/60 text-amber-400/50 border border-slate-700/50 cursor-not-allowed"
+                    title="Pausing at safe boundary..."
+                  >
+                    <RefreshCw size={11} className="animate-spin text-amber-400" />
+                  </button>
+                  <button
+                    onClick={stop}
+                    className="p-1 rounded-lg bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
+                    title="Stop Agent Execution"
+                  >
+                    <StopCircle size={11} fill="currentColor" />
+                  </button>
+                </>
+              )}
+
+              {executionState === 'paused' && (
+                <>
+                  <button
+                    onClick={resume}
+                    className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-600 hover:bg-amber-500 text-white text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer"
+                    title="Resume Agent Execution"
+                  >
+                    <Play size={10} fill="currentColor" />
+                    <span>Resume</span>
+                  </button>
+                  <button
+                    onClick={stop}
+                    className="p-1 rounded-lg bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
+                    title="Stop Agent Execution"
+                  >
+                    <StopCircle size={11} fill="currentColor" />
+                  </button>
+                </>
+              )}
+
+              {executionState === 'stopping' && (
+                <div className="flex items-center gap-1 text-[9px] font-bold text-red-400 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded">
+                  <RefreshCw size={9} className="animate-spin text-red-400" />
+                  <span>Stopping...</span>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
 
         {/* Toolbar Action Buttons */}
         <div className="flex items-center gap-1">

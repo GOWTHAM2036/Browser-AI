@@ -6,6 +6,7 @@ export interface ActionResult {
   action: AgentAction['action'];
   element_id?: string;
   error?: string;
+  stale?: boolean;
 }
 
 export function buildExecutionScript(
@@ -29,6 +30,7 @@ export function buildExecutionScript(
     var amount = rawAction.amount || 500;
 
     console.log('[ARIA_EXEC] START action=' + actionType + ' elementId=' + elementId);
+    window.__ARIA_AGENT_DISPATCHING__ = true;
 
     // --- Inject In-Page CSS Animation Styles if needed ---
     if (!document.getElementById('aria-inpage-styles')) {
@@ -86,6 +88,7 @@ export function buildExecutionScript(
 
     // --- IPC result reporter ---
     var result = function(data) {
+      window.__ARIA_AGENT_DISPATCHING__ = false;
       try { window.__ARIA_AGENT_RESULT__ = data; } catch(e) {}
       var payloadStr = JSON.stringify(data);
       console.log('[ARIA_EXEC] RESULT_READY payload=' + payloadStr);
@@ -154,7 +157,26 @@ export function buildExecutionScript(
     }
 
     if (!el && ['click', 'type', 'type_and_submit', 'press', 'select'].includes(actionType)) {
-      throw new Error('Element not found in DOM or at coordinates for action: ' + actionType + ' (id: ' + elementId + ')');
+      result({
+        success: false,
+        action: actionType,
+        element_id: elementId,
+        stale: true,
+        error: 'Element not found in DOM or at coordinates (stale reference): id=' + elementId
+      });
+      return;
+    }
+
+    // Check if element was detached from document (user interaction or re-render)
+    if (el && !el.isConnected) {
+      result({
+        success: false,
+        action: actionType,
+        element_id: elementId,
+        stale: true,
+        error: 'Element was disconnected from the DOM (stale reference): id=' + elementId
+      });
+      return;
     }
 
     if (el && (el.disabled || el.getAttribute('aria-disabled') === 'true')) {
@@ -492,12 +514,15 @@ export function buildExecutionScript(
       }
     }
   } catch (err) {
+    window.__ARIA_AGENT_DISPATCHING__ = false;
     var errorMsg = String(err && err.message ? err.message : err);
     console.log('[ARIA_EXEC] ERROR ' + errorMsg);
+    var isErrStale = errorMsg.indexOf('not found') !== -1 || errorMsg.indexOf('stale') !== -1;
     var payloadStr = JSON.stringify({
       success: false,
       action: typeof rawAction !== 'undefined' && rawAction ? (rawAction.action || rawAction.type || 'unknown') : 'unknown',
-      error: errorMsg
+      error: errorMsg,
+      stale: isErrStale
     });
     try { window.__ARIA_AGENT_RESULT__ = JSON.parse(payloadStr); } catch(e) {}
     sendIpc('ARIA_AGENT_RESULT:' + payloadStr);

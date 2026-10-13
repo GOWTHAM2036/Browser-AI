@@ -34,6 +34,15 @@ export interface Bookmark {
   created_at: number;
 }
 
+export type AgentExecutionState =
+  | 'idle'
+  | 'running'
+  | 'pausing'
+  | 'paused'
+  | 'stopping'
+  | 'completed'
+  | 'error';
+
 export interface AgentStepItem {
   id: string;
   timestamp: string;
@@ -48,6 +57,8 @@ export interface AgentMessageData {
   status: string;
   running: boolean;
   paused: boolean;
+  executionState?: AgentExecutionState;
+  pendingAction?: string;
   currentStep: number;
   timeline: AgentStepItem[];
   logs: string[];

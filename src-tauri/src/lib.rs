@@ -62,9 +62,85 @@ fn get_migrations() -> Vec<Migration> {
     ]
 }
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub const IN_PAGE_BLOCKER_JS: &str = r#"
+(function() {
+  window.__ARIA_AGENT_USER_INPUT_BLOCKED__ = true;
+  if (window.__ARIA_INTERACTION_BLOCKER_INITIALIZED__) return;
+  window.__ARIA_INTERACTION_BLOCKER_INITIALIZED__ = true;
+
+  if (typeof window.__ARIA_AGENT_DISPATCHING__ === 'undefined') {
+    window.__ARIA_AGENT_DISPATCHING__ = false;
+  }
+
+  function shouldBlock(e) {
+    if (!window.__ARIA_AGENT_USER_INPUT_BLOCKED__) return false;
+    if (window.__ARIA_AGENT_DISPATCHING__) return false;
+    if (e && e.isTrusted === false) return false;
+    return true;
+  }
+
+  function blockEventHandler(e) {
+    if (!shouldBlock(e)) return;
+    try {
+      e.preventDefault();
+      e.stopPropagation();
+      e.stopImmediatePropagation();
+    } catch(err) {}
+    var badge = document.getElementById('aria-inpage-status-badge');
+    if (badge) {
+      badge.style.transform = 'scale(1.06)';
+      badge.style.boxShadow = '0 0 24px rgba(245,158,11,0.9)';
+      setTimeout(function() {
+        if (badge) {
+          badge.style.transform = 'scale(1)';
+          badge.style.boxShadow = '';
+        }
+      }, 350);
+    }
+    return false;
+  }
+
+  var eventsToBlock = [
+    'click', 'dblclick', 'auxclick', 'mousedown', 'mouseup',
+    'pointerdown', 'pointerup', 'contextmenu',
+    'keydown', 'keypress', 'keyup', 'beforeinput',
+    'wheel', 'touchmove', 'dragstart', 'drop', 'submit'
+  ];
+
+  eventsToBlock.forEach(function(eventType) {
+    window.addEventListener(eventType, blockEventHandler, { capture: true, passive: false });
+  });
+
+  window.addEventListener('selectstart', function(e) {
+    if (shouldBlock(e)) {
+      e.preventDefault();
+      return false;
+    }
+  }, { capture: true });
+
+  window.__ARIA_RELEASE_INTERACTION_BLOCK__ = function() {
+    window.__ARIA_AGENT_USER_INPUT_BLOCKED__ = false;
+  };
+})();
+"#;
+
+pub const IN_PAGE_UNBLOCKER_JS: &str = r#"
+(function() {
+  window.__ARIA_AGENT_USER_INPUT_BLOCKED__ = false;
+  if (typeof window.__ARIA_RELEASE_INTERACTION_BLOCK__ === 'function') {
+    try { window.__ARIA_RELEASE_INTERACTION_BLOCK__(); } catch(e) {}
+  }
+})();
+"#;
+
+#[derive(Clone, Default)]
+pub struct WebviewLockState {
+    pub locked: Arc<Mutex<HashSet<String>>>,
+}
 
 struct PendingIpcMessage {
     total_chunks: usize,
@@ -174,6 +250,8 @@ async fn create_tab_webview(
     let webview_label_clone = webview_label.clone();
     let app_handle_page_load = app_handle.clone();
     let webview_label_page_load = webview_label.clone();
+    let lock_state = app_handle.state::<WebviewLockState>().inner().clone();
+    let webview_label_for_lock = webview_label.clone();
     let chunk_assembler = IpcChunkAssembler::new();
 
     let suppress_beforeunload_js = r#"
@@ -295,7 +373,14 @@ async fn create_tab_webview(
         );
         true
     })
-    .on_page_load(move |_webview, payload| {
+    .on_page_load(move |webview, payload| {
+        if let tauri::webview::PageLoadEvent::Finished = payload.event() {
+            if let Ok(set) = lock_state.locked.lock() {
+                if set.contains(&webview_label_for_lock) {
+                    let _ = webview.eval(IN_PAGE_BLOCKER_JS);
+                }
+            }
+        }
         let url_str = payload.url().to_string();
         let event_type = match payload.event() {
             tauri::webview::PageLoadEvent::Started => "page_start_load",
@@ -494,9 +579,32 @@ fn reset_media_permissions(app_handle: tauri::AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+#[tauri::command]
+fn set_tab_interaction_lock(
+    app_handle: tauri::AppHandle,
+    webview_label: String,
+    locked: bool,
+) -> Result<(), String> {
+    let lock_state = app_handle.state::<WebviewLockState>();
+    {
+        let mut set = lock_state.locked.lock().map_err(|e| e.to_string())?;
+        if locked {
+            set.insert(webview_label.clone());
+        } else {
+            set.remove(&webview_label);
+        }
+    }
+    if let Some(webview) = app_handle.get_webview(&webview_label) {
+        let js = if locked { IN_PAGE_BLOCKER_JS } else { IN_PAGE_UNBLOCKER_JS };
+        let _ = webview.eval(js);
+    }
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .manage(WebviewLockState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_http::init())
         .plugin(
@@ -538,6 +646,7 @@ pub fn run() {
             destroy_tab_webview,
             navigate_tab_webview,
             eval_tab_webview,
+            set_tab_interaction_lock,
             extract_page_text,
             send_page_content,
             save_credential,
@@ -635,4 +744,21 @@ mod tests {
         // Empty message ID
         assert!(assembler.process_chunk("tab-1", "", 0, 1, "data".to_string()).is_err());
     }
+
+    #[test]
+    fn test_webview_lock_state() {
+        let lock_state = WebviewLockState::default();
+        {
+            let mut set = lock_state.locked.lock().unwrap();
+            assert!(!set.contains("tab-test-1"));
+            set.insert("tab-test-1".to_string());
+            assert!(set.contains("tab-test-1"));
+        }
+        {
+            let mut set = lock_state.locked.lock().unwrap();
+            set.remove("tab-test-1");
+            assert!(!set.contains("tab-test-1"));
+        }
+    }
 }
+

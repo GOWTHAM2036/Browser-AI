@@ -15,9 +15,11 @@ import {
   Terminal, 
   Bot,
   Zap,
-  GraduationCap
+  GraduationCap,
+  AlertCircle
 } from 'lucide-react';
-import { Message } from '../../types';
+import { Message, AgentExecutionState } from '../../types';
+import { useAgentExecutionStore } from '../../store/agentExecutionStore';
 import { marked } from 'marked';
 
 interface SidePanelChatProps {
@@ -54,6 +56,8 @@ export const SidePanelChat: React.FC<SidePanelChatProps> = ({
   providerName
 }) => {
   const [expandedLogs, setExpandedLogs] = useState<Record<string, boolean>>({});
+  const confirmationMessage = useAgentExecutionStore(s => s.confirmationMessage);
+  const respondConfirmation = useAgentExecutionStore(s => s.respondConfirmation);
 
   const toggleLogs = (msgId: string) => {
     setExpandedLogs(prev => ({ ...prev, [msgId]: !prev[msgId] }));
@@ -143,8 +147,15 @@ export const SidePanelChat: React.FC<SidePanelChatProps> = ({
 
             // Embedded Agent Card
             if (isAgent && msg.agentData) {
-              const { goal, status, running, paused, currentStep, timeline, logs, result } = msg.agentData;
+              const { goal, status, running, paused, executionState, pendingAction, currentStep, timeline, logs, result } = msg.agentData;
               const showLogs = expandedLogs[msg.id] || false;
+
+              // Resolve effective state
+              const effectiveState: AgentExecutionState =
+                executionState ||
+                (running ? (paused ? 'paused' : 'running') : (status?.toLowerCase().includes('error') ? 'error' : 'completed'));
+
+              const isExecutionActive = ['running', 'pausing', 'paused', 'stopping'].includes(effectiveState);
 
               return (
                 <div key={msg.id} className="flex flex-col items-start w-full">
@@ -159,32 +170,133 @@ export const SidePanelChat: React.FC<SidePanelChatProps> = ({
                           Browser Agent
                         </span>
                         <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded-full uppercase tracking-wider ${
-                          running ? (paused ? 'bg-amber-950 text-amber-300 border border-amber-800/50' : 'bg-purple-950 text-purple-300 border border-purple-800/50 animate-pulse') : 'bg-slate-800 text-slate-400'
+                          effectiveState === 'running' ? 'bg-purple-950 text-purple-300 border border-purple-800/50 animate-pulse' :
+                          effectiveState === 'pausing' ? 'bg-amber-950 text-amber-300 border border-amber-800/50 animate-pulse' :
+                          effectiveState === 'paused' ? 'bg-amber-950 text-amber-300 border border-amber-800/50' :
+                          effectiveState === 'stopping' ? 'bg-red-950 text-red-300 border border-red-800/50 animate-pulse' :
+                          effectiveState === 'completed' ? 'bg-emerald-950 text-emerald-300 border border-emerald-800/50' :
+                          effectiveState === 'error' ? 'bg-red-950 text-red-300 border border-red-800/50' :
+                          'bg-slate-800 text-slate-400'
                         }`}>
-                          {running ? (paused ? 'Paused' : 'Executing') : 'Finished'}
+                          {effectiveState === 'running' ? 'Executing' :
+                           effectiveState === 'pausing' ? 'Pausing...' :
+                           effectiveState === 'paused' ? 'Paused' :
+                           effectiveState === 'stopping' ? 'Stopping...' :
+                           effectiveState === 'completed' ? 'Completed' :
+                           effectiveState === 'error' ? 'Error' :
+                           'Finished'}
                         </span>
                       </div>
 
                       {/* Interactive Controls */}
-                      {running && (
+                      {isExecutionActive && (
                         <div className="flex items-center gap-1">
-                          <button
-                            onClick={() => paused ? onResumeAgent(msg.id) : onPauseAgent(msg.id)}
-                            className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-amber-400 border border-slate-700 transition-all cursor-pointer"
-                            title={paused ? "Resume Task" : "Pause Task"}
-                          >
-                            {paused ? <Play size={11} fill="currentColor" /> : <Pause size={11} fill="currentColor" />}
-                          </button>
-                          <button
-                            onClick={() => onStopAgent(msg.id)}
-                            className="p-1 rounded bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
-                            title="Stop Task"
-                          >
-                            <StopCircle size={11} fill="currentColor" />
-                          </button>
+                          {/* Running: Show Pause and Stop */}
+                          {effectiveState === 'running' && (
+                            <>
+                              <button
+                                onClick={() => onPauseAgent(msg.id)}
+                                className="p-1 rounded bg-slate-800 hover:bg-slate-700 text-amber-400 border border-slate-700 transition-all cursor-pointer"
+                                title="Pause Task"
+                              >
+                                <Pause size={11} fill="currentColor" />
+                              </button>
+                              <button
+                                onClick={() => onStopAgent(msg.id)}
+                                className="p-1 rounded bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
+                                title="Stop Task"
+                              >
+                                <StopCircle size={11} fill="currentColor" />
+                              </button>
+                            </>
+                          )}
+
+                          {/* Pausing: Disabled Pause with spinner, Stop enabled */}
+                          {effectiveState === 'pausing' && (
+                            <>
+                              <button
+                                disabled
+                                className="p-1 rounded bg-slate-800/60 text-amber-400/50 border border-slate-700/50 cursor-not-allowed"
+                                title="Pausing at safe point..."
+                              >
+                                <RefreshCw size={11} className="animate-spin text-amber-400" />
+                              </button>
+                              <button
+                                onClick={() => onStopAgent(msg.id)}
+                                className="p-1 rounded bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
+                                title="Stop Task"
+                              >
+                                <StopCircle size={11} fill="currentColor" />
+                              </button>
+                            </>
+                          )}
+
+                          {/* Paused: Show Resume and Stop */}
+                          {effectiveState === 'paused' && (
+                            <>
+                              <button
+                                onClick={() => onResumeAgent(msg.id)}
+                                className="flex items-center gap-1 px-2 py-0.5 rounded bg-amber-600 hover:bg-amber-500 text-white text-[10px] font-bold uppercase tracking-wider transition-all cursor-pointer"
+                                title="Resume Task"
+                              >
+                                <Play size={10} fill="currentColor" />
+                                <span>Resume</span>
+                              </button>
+                              <button
+                                onClick={() => onStopAgent(msg.id)}
+                                className="p-1 rounded bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-800/50 transition-all cursor-pointer"
+                                title="Stop Task"
+                              >
+                                <StopCircle size={11} fill="currentColor" />
+                              </button>
+                            </>
+                          )}
+
+                          {/* Stopping: Disable conflicting controls and show clear status */}
+                          {effectiveState === 'stopping' && (
+                            <div className="flex items-center gap-1 text-[10px] font-bold text-red-400 bg-red-950/60 border border-red-800/50 px-2 py-0.5 rounded">
+                              <RefreshCw size={9} className="animate-spin text-red-400" />
+                              <span>Stopping...</span>
+                            </div>
+                          )}
                         </div>
                       )}
                     </div>
+
+                    {/* Pending Action Display */}
+                    {pendingAction && isExecutionActive && (
+                      <div className="flex items-center gap-1.5 text-[10px] text-amber-300 bg-amber-950/40 border border-amber-800/40 px-2.5 py-1 rounded-lg font-mono">
+                        <span className="font-bold uppercase tracking-wider text-[8px] text-amber-400">Action:</span>
+                        <span className="truncate">{pendingAction}</span>
+                      </div>
+                    )}
+
+                    {/* Consequential Action Confirmation Prompt */}
+                    {confirmationMessage && isExecutionActive && (
+                      <div className="bg-amber-950/70 border border-amber-600/70 rounded-xl p-3 flex flex-col gap-2 text-xs shadow-lg">
+                        <div className="flex items-center gap-1.5 text-amber-300 font-bold uppercase text-[10px] tracking-wider">
+                          <AlertCircle size={14} className="text-amber-400" />
+                          <span>Confirmation Required</span>
+                        </div>
+                        <p className="text-amber-100 text-[11px] leading-relaxed">
+                          {confirmationMessage}
+                        </p>
+                        <div className="flex items-center gap-2 pt-1">
+                          <button
+                            onClick={() => respondConfirmation(true)}
+                            className="flex-1 bg-amber-600 hover:bg-amber-500 text-white font-bold py-1.5 rounded-lg text-[10px] uppercase tracking-wider transition-all cursor-pointer shadow-md"
+                          >
+                            Proceed
+                          </button>
+                          <button
+                            onClick={() => respondConfirmation(false)}
+                            className="flex-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-bold py-1.5 rounded-lg text-[10px] uppercase tracking-wider transition-all cursor-pointer border border-slate-700"
+                          >
+                            Cancel Action
+                          </button>
+                        </div>
+                      </div>
+                    )}
 
                     {/* Goal */}
                     <div className="text-xs text-slate-200 font-medium bg-slate-950/50 p-2 rounded-lg border border-slate-800/60">

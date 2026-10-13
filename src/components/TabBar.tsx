@@ -1,10 +1,13 @@
 import React from 'react';
 import { useBrowserStore } from '../store/browserStore';
+import { useAgentExecutionStore } from '../store/agentExecutionStore';
 import { X, Plus, Pin } from 'lucide-react';
 import { getCurrentWindow } from '@tauri-apps/api/window';
 
 export const TabBar: React.FC = () => {
   const { tabs, activeTabId, addTab, closeTab, setActiveTabId, reorderTabs, updateTab } = useBrowserStore();
+  const { executionState } = useAgentExecutionStore();
+  const isAgentRunning = executionState === 'running' || executionState === 'pausing';
 
   const handleDragStart = (e: React.DragEvent, index: number) => {
     e.dataTransfer.setData('text/plain', index.toString());
@@ -101,10 +104,16 @@ export const TabBar: React.FC = () => {
                   <button
                     onClick={(e) => {
                       e.stopPropagation();
+                      if (isAgentRunning && tab.id === activeTabId) return;
                       closeTab(tab.id);
                     }}
-                    className="p-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-700 leading-none transition-opacity opacity-0 group-hover:opacity-100"
-                    title="Close Tab"
+                    disabled={isAgentRunning && tab.id === activeTabId}
+                    className={`p-0.5 rounded leading-none transition-opacity ${
+                      isAgentRunning && tab.id === activeTabId
+                        ? 'cursor-not-allowed opacity-20 text-slate-600'
+                        : 'text-slate-400 hover:text-white hover:bg-slate-700 opacity-0 group-hover:opacity-100'
+                    }`}
+                    title={isAgentRunning && tab.id === activeTabId ? "Agent running on this tab. Pause or stop agent before closing." : "Close Tab"}
                   >
                     <X size={11} />
                   </button>

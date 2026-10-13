@@ -8,6 +8,7 @@ import { dbGetChatHistory, dbAddChatMessage, dbClearChatHistory } from '../servi
 import { Message, AgentStepItem, AgentMessageData } from '../types';
 import { runAgentLoop, cancelActiveAgentRun } from '../services/agent/agentLoop';
 import { runAutoQuizSolver, cancelActiveQuizRun } from '../services/agent/quizSolver';
+import { globalAgentStateMachine } from '../services/agent/executionStateMachine';
 import hljs from 'highlight.js';
 import 'highlight.js/styles/github-dark.css';
 
@@ -383,30 +384,74 @@ export const SidePanel: React.FC = () => {
 
   const pauseAgent = (msgId: string) => {
     agentPausedRef.current[msgId] = true;
+    globalAgentStateMachine.requestPause();
     setMessages(prev => prev.map(m => m.id === msgId && m.agentData ? {
       ...m,
-      agentData: { ...m.agentData, paused: true, status: 'Paused by user' }
+      agentData: {
+        ...m.agentData,
+        paused: true,
+        executionState: 'pausing',
+        status: 'Pausing...'
+      }
     } : m));
   };
 
   const resumeAgent = (msgId: string) => {
     agentPausedRef.current[msgId] = false;
+    globalAgentStateMachine.requestResume();
     setMessages(prev => prev.map(m => m.id === msgId && m.agentData ? {
       ...m,
-      agentData: { ...m.agentData, paused: false, status: 'Resuming...' }
+      agentData: {
+        ...m.agentData,
+        paused: false,
+        executionState: 'running',
+        status: 'Resuming...'
+      }
     } : m));
   };
 
   const stopAgent = (msgId: string) => {
+    agentCancelRef.current[msgId] = true;
+    globalAgentStateMachine.requestStop();
     cancelActiveAgentRun();
     cancelActiveQuizRun();
-    agentCancelRef.current[msgId] = true;
     setIsAgentRunning(false);
     setMessages(prev => prev.map(m => m.id === msgId && m.agentData ? {
       ...m,
-      agentData: { ...m.agentData, running: false, status: 'Aborted by user' }
+      agentData: {
+        ...m.agentData,
+        running: false,
+        executionState: 'stopping',
+        status: 'Stopping...'
+      }
     } : m));
   };
+
+  // Keep chat message agentData in sync with centralized state machine
+  useEffect(() => {
+    const unsub = globalAgentStateMachine.subscribe((state) => {
+      const activeMsgId = globalAgentStateMachine.getMsgId();
+      const pendingAction = globalAgentStateMachine.getPendingAction();
+
+      setIsAgentRunning(['running', 'pausing', 'paused', 'stopping'].includes(state));
+
+      setMessages(prev => prev.map(m => {
+        if (!m.agentData) return m;
+        if (activeMsgId && m.id !== activeMsgId && !m.agentData.running) return m;
+        return {
+          ...m,
+          agentData: {
+            ...m.agentData,
+            executionState: state,
+            pendingAction: pendingAction || undefined,
+            paused: state === 'paused' || state === 'pausing',
+            running: ['running', 'pausing', 'paused', 'stopping'].includes(state)
+          }
+        };
+      }));
+    });
+    return unsub;
+  }, []);
 
   // Single Unified Submission Handler
   const handleSendMessage = async (textToSend?: string) => {
