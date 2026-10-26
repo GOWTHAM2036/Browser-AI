@@ -1,0 +1,15 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "tab-capability",
+  "description": "Capability for child tab webviews",
+  "windows": ["tab-*"],
+  "remote": {
+    "urls": [
+      "https://*",
+      "http://*"
+    ]
+  },
+  "permissions": [
+    "core:webview:default"
+  ]
+}
